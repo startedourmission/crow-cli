@@ -1,0 +1,555 @@
+"""Mouse input, the status-bar Files button / explorer, and saved hosts."""
+import os
+from pathlib import Path
+import pty
+import select
+import struct
+import subprocess
+import tempfile
+import termios
+import time
+import unittest
+
+REPO = Path(__file__).resolve().parents[1]
+CROW = str(REPO / "crow")
+os.environ.setdefault("CROWCLI_NO_IME_SWITCH", "1")
+
+
+class UiTests(unittest.TestCase):
+    def setUp(self):
+        self.home = tempfile.TemporaryDirectory(prefix="cch-", dir="/tmp")
+        self.root = tempfile.TemporaryDirectory(prefix="ccr-", dir="/tmp")
+        self.ws = tempfile.TemporaryDirectory(prefix="ccw-", dir="/tmp")
+        Path(self.ws.name, "note.txt").write_text("hello explorer\n")
+        Path(self.ws.name, "sub").mkdir()
+        self.editor_marker = Path(self.ws.name) / "edited.txt"
+        editor = Path(self.ws.name) / "fake-editor.sh"
+        editor.write_text("#!/bin/sh\nprintf '%s\\n' \"$@\" >> '"
+                          + str(self.editor_marker) + "'\nexec /bin/sh\n")
+        editor.chmod(0o700)
+        self.env = dict(os.environ, CROWCLI_HOME=self.home.name,
+                        CROWCLI_SESSION_ROOT=self.root.name,
+                        SHELL="/bin/sh", TERM="xterm-256color",
+                        EDITOR=str(editor))
+
+    def tearDown(self):
+        subprocess.run([CROW, "kill-session", "-t", "demo"], env=self.env,
+                       capture_output=True, timeout=30)
+        self.home.cleanup()
+        self.root.cleanup()
+        self.ws.cleanup()
+
+    def cli(self, *args, **kwargs):
+        check = kwargs.pop("check", True)
+        result = subprocess.run([CROW] + list(args), env=self.env,
+                                capture_output=True, text=True, timeout=30)
+        if check and result.returncode != 0:
+            raise AssertionError("%s: %s" % (args, result.stderr))
+        return result
+
+    def attach(self, steps):
+        master, slave = pty.openpty()
+        import fcntl
+        fcntl.ioctl(slave, termios.TIOCSWINSZ,
+                    struct.pack("HHHH", 24, 80, 0, 0))
+        proc = subprocess.Popen([CROW, "attach", "-t", "demo"],
+                                stdin=slave, stdout=slave, stderr=slave,
+                                env=self.env)
+        os.close(slave)
+        out = b""
+
+        def drain(wait):
+            nonlocal out
+            end = time.time() + wait
+            while time.time() < end:
+                if select.select([master], [], [], 0.05)[0]:
+                    try:
+                        out += os.read(master, 65536)
+                    except OSError:
+                        break
+
+        drain(1.5)
+        for data, wait in steps:
+            os.write(master, data)
+            drain(wait)
+        proc.wait(timeout=10)
+        os.close(master)
+        return out
+
+    def test_saved_hosts_crud(self):
+        self.cli("host", "add", "mac", "--address", "me@10.0.0.5",
+                 "--port", "2222")
+        listing = self.cli("hosts").stdout
+        self.assertIn("mac: me@10.0.0.5", listing)
+        self.assertIn("port=2222", listing)
+        self.cli("host", "rm", "mac")
+        self.assertIn("no saved hosts", self.cli("hosts").stdout)
+        # One field is enough: the name is derived, key defaults to ssh's.
+        self.cli("host", "add", "jinwoo@10.0.0.9")
+        listing = self.cli("hosts").stdout
+        self.assertIn("jinwoo@10.0.0.9", listing)
+        self.assertIn("key=기본(자동)", listing)
+
+    def test_mouse_click_focuses_pane_and_wheel_does_not_crash(self):
+        self.cli("new", "-d", "-s", "demo", "-c", self.ws.name, "--",
+                 "exec /bin/sh")
+        self.cli("split-window", "-t", "demo")
+        click_left = b"\x1b[<0;35;5M\x1b[<0;35;5m"  # first pane (sidebar is 0-28)
+        wheel_up = b"\x1b[<64;50;5M"
+        out = self.attach([
+            (b"seq 1 40\n", 1.2),
+            (wheel_up, 0.8),
+            (click_left, 0.8),
+            (b"echo CLICKED_LEFT_$((3*3))\n", 1.0),
+            (b"\x02d", 1.0),
+        ])
+        self.assertIn(b"\x1b[?1002h\x1b[?1006h", out)  # mouse reporting on
+        self.assertIn(b"CLICKED_LEFT_9", out)
+
+    def test_files_button_opens_explorer_and_file_in_editor_pane(self):
+        self.cli("new", "-d", "-s", "demo", "-c", self.ws.name, "--",
+                 "exec /bin/sh")
+        click_files = b"\x1b[<0;10;24M\x1b[<0;10;24m"  # after " Hosts "
+        out = self.attach([
+            (click_files, 1.2),
+            (b"\x1b[B\x1b[B\x1b[B", 0.8),   # .., sub/, fake-editor.sh -> note.txt
+            (b"\r", 2.0),            # open file in an editor pane
+            (b"\x02d", 1.0),
+        ])
+        self.assertIn(" Files ".encode(), out)
+        self.assertIn(b"Files:", out)
+        self.assertIn(b"note.txt", out)
+        self.assertTrue(self.editor_marker.exists(),
+                        "file was not opened in the editor pane")
+        self.assertIn("note.txt", self.editor_marker.read_text())
+        self.assertIn("2 pane(s)", self.cli("ls").stdout)
+
+    def test_reverse_panel_starts_agent_and_switches(self):
+        self.cli("new", "-d", "-s", "demo", "-c", self.ws.name, "--",
+                 "exec /bin/sh")
+        click_bar = b"\x1b[<0;15;24M\x1b[<0;15;24m"  # old [리버스] spot
+        out = self.attach([
+            (click_bar, 0.6),
+            (b"\x02a", 1.2),
+            (b"\x02d", 1.0),
+        ])
+        self.assertIn("리버스".encode(), out)
+        self.assertIn("호스트 · 리버스".encode(), out)  # merged sidebar tab
+        self.assertIn("저장된 호스트가 없습니다".encode(), out)
+        self.assertNotIn("로컬 샌드박스 실행".encode(), out)
+        # The local fake-agent flow lives on the CLI (--local), not the UI.
+        self.cli("reverse-agent", "--local", "--provider", "fake",
+                 "-s", "agent-fake", "-d", "--dir", self.ws.name)
+        captured = b""
+        deadline = time.time() + 10
+        while time.time() < deadline and \
+                b"client workspace is" not in captured:
+            captured = subprocess.run(
+                [CROW, "capture", "-t", "agent-fake"], env=self.env,
+                capture_output=True, timeout=30).stdout
+            time.sleep(0.2)
+        self.assertIn(b"client workspace is", captured)
+        target = Path(self.ws.name) / "reverse-agent-was-here.txt"
+        deadline = time.time() + 10
+        while not target.exists() and time.time() < deadline:
+            time.sleep(0.1)
+        self.assertTrue(target.exists())
+        self.assertIn("agent-fake", self.cli("ls").stdout)
+        subprocess.run([CROW, "kill-session", "-t", "agent-fake"],
+                       env=self.env, capture_output=True, timeout=30)
+
+    def test_prefix_e_toggles_explorer(self):
+        self.cli("new", "-d", "-s", "demo", "-c", self.ws.name, "--",
+                 "exec /bin/sh")
+        out = self.attach([
+            (b"\x02e", 1.2),
+            (b"q", 0.8),
+            (b"\x02d", 1.0),
+        ])
+        self.assertIn(b"Files:", out)
+        self.assertIn(b"sub/", out)
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+class FailureDisplayTests(unittest.TestCase):
+    """Failures must be visible: reason in the sidebar, red, with a notice."""
+
+    def test_probe_error_classification(self):
+        from crowcli.client import Client
+        cases = {
+            "Permission denied (publickey).": "연결 실패 (인증 오류)",
+            "Host key verification failed.": "연결 실패 (호스트 키)",
+            "ssh: connect to host x: Operation timed out": "연결 실패 (시간 초과)",
+            "Could not resolve hostname x": "연결 실패 (주소 확인 불가)",
+            "Connection refused": "연결 실패 (연결 거부)",
+            "whatever": "연결 실패",
+        }
+        for stderr, expected in cases.items():
+            self.assertEqual(Client.classify_probe_error(stderr), expected)
+
+    def test_focus_colours_only_the_focused_panes_edge(self):
+        from crowcli.client import Client, compute_rects
+        from crowcli.vt import Screen
+        client = Client(object())
+        client._winsize = lambda: (80, 24)
+        tree = {"split": "v", "ratio": 0.5,
+                "a": {"leaf": "a"}, "b": {"leaf": "b"}}
+        rects = compute_rects(tree, {"a": {}, "b": {}}, *client._area())
+        left_edge = rects["a"][0] + rects["a"][2]  # a's own line
+        right_edge = rects["b"][0] - 1              # b's own line
+        self.assertEqual(right_edge - left_edge, 1)  # two lines, 2 cells
+
+        def colours(active):
+            client.active_id = active
+            screen = Screen(80, 24)
+            screen.feed(client._borders(rects))
+            row = screen.grid[5]
+            return row[left_edge][1][0], row[right_edge][1][0]
+
+        cyan = ("p", 51)
+        self.assertEqual(colours("a"), (cyan, ("p", 240)))
+        self.assertEqual(colours("b"), (("p", 240), cyan))
+
+    def test_sidebar_shows_failure_in_red_with_notice(self):
+        from crowcli.client import Client
+        client = Client(
+            object(),
+            sidebar_data_provider=lambda: {
+                "sessions": [{"name": "agent-claude",
+                              "status": "연결 실패", "current": False}],
+                "hosts": [{"name": "mac", "address": "u@bad"}]},
+            notice_provider=lambda: "리버스 시작 실패: 인증 오류")
+        client._host_status["u@bad"] = {
+            "state": "연결 실패 (인증 오류)", "color": "31",
+            "at": time.time()}
+        out = client._sidebar_chunk()
+        self.assertIn("연결 실패 (인증 오류)".encode(), out)
+        self.assertIn("리버스 시작 실패".encode(), out)
+        self.assertIn(b"48;5;160", out)  # red background
+        self.assertIn("✗".encode(), out)
+
+
+class HelpPopupTests(unittest.TestCase):
+    def test_prefix_question_opens_popup_and_any_key_closes(self):
+        from crowcli.client import Client
+        from crowcli.vt import Screen
+        client = Client(object())
+        client._winsize = lambda: (100, 30)
+        self.assertIsNone(client._input(b"\x02?", {}))  # stays attached
+        self.assertTrue(client.help_open)
+        client._help_opened_at = 0  # skip the pop-in
+        screen = Screen(100, 30)
+        screen.feed(client._help_chunk())
+        text = "\n".join("".join(c[0] for c in row) for row in screen.grid)
+        self.assertIn("crow-cli 단축키", text)
+        self.assertIn("좌우로 분할", text)
+        self.assertIn("아무 키나 누르면 닫힘", text)
+        client._input(b"\x1b[<0;5;5m", {})  # mouse release: still open
+        self.assertTrue(client.help_open)
+        self.assertIsNone(client._input(b"q", {}))  # swallowed, not sent
+        self.assertFalse(client.help_open)
+
+
+class HostFormTests(unittest.TestCase):
+    def make_client(self, saved):
+        from crowcli.client import Client
+
+        def save(address, port, identity):
+            if port == "0":
+                raise ValueError("포트는 1~65535 사이 숫자여야 해요")
+            saved.append((address, port, identity))
+            return {"name": "box", "address": address}
+        client = Client(object(), host_form={
+            "keys": lambda: [("~/.ssh/id_ed25519", "/k/id_ed25519")],
+            "derive": lambda a: "box", "save": save})
+        client._winsize = lambda: (100, 30)
+        client._toggle_reverse = lambda: setattr(
+            client, "reverse_open", not client.reverse_open)
+        return client
+
+    def test_form_saves_and_opens_host_menu(self):
+        from crowcli.vt import Screen
+        saved = []
+        client = self.make_client(saved)
+        client._open_host_form()
+        client.form["opened"] = 0
+        for unit in [b"r", b"o", b"o", b"t", b"@", b"b", b"x", b"\x7f",
+                     b"o", b"x", b"\t", b"a", b"0", b"\t", b"\x1b[C"]:
+            self.assertIsNone(client._input(unit, {}))
+        screen = Screen(100, 30)
+        screen.feed(client._form_chunk())
+        text = "\n".join("".join(c[0] for c in row) for row in screen.grid)
+        self.assertIn("호스트 추가", text)
+        self.assertIn("root@box", text)
+        self.assertIn("id_ed25519", text)
+        client._input(b"\r", {})
+        self.assertEqual(saved, [])  # port "0" rejected, form stays
+        self.assertIn("1~65535", client.form["error"])
+        client.form["port"] = "2222"
+        client._input(b"\r", {})
+        self.assertEqual(saved, [("root@box", "2222", "/k/id_ed25519")])
+        self.assertIsNone(client.form)
+        self.assertTrue(client.reverse_open)
+        self.assertEqual(client.reverse_stage, "menu")
+
+    def test_escape_cancels_and_empty_address_is_refused(self):
+        saved = []
+        client = self.make_client(saved)
+        client._open_host_form()
+        client._input(b"\r", {})
+        self.assertIn("주소", client.form["error"])
+        client._input(b"", {}, flush_esc=True)  # nothing buffered
+        client._input(b"\x1b", {})
+        client._input(b"", {}, flush_esc=True)
+        self.assertIsNone(client.form)
+        self.assertEqual(saved, [])
+
+    def test_cancel_targets_button_hint_and_outside(self):
+        from crowcli.vt import Screen
+
+        def find(client, word, bottom=False):
+            screen = Screen(100, 30)
+            screen.feed(client._form_chunk())
+            rows = range(29, -1, -1) if bottom else range(30)
+            for y in rows:
+                cols = [c[0] for c in screen.grid[y]]
+                for x in range(len(cols)):
+                    if "".join(cols[x:x + len(word)]) == word:
+                        return x + 1, y + 1
+            self.fail(word)
+
+        def click(client, x, y):
+            client._input(("\x1b[<0;%d;%dM" % (x, y)).encode(), {})
+
+        for word, bottom in (("취", False), ("Esc", True)):
+            client = self.make_client([])
+            client._open_host_form()
+            client.form["opened"] = 0
+            click(client, *find(client, word, bottom))
+            self.assertIsNone(client.form, word)
+        client = self.make_client([])
+        client._open_host_form()
+        client.form["opened"] = 0
+        client._form_chunk()
+        self.assertTrue(client.form["full"])
+        self.assertFalse(client._form_animating())
+        click(client, 50, 15)  # inside, not on a target: stays open
+        self.assertIsNotNone(client.form)
+        click(client, 2, 2)
+        self.assertIsNone(client.form)
+
+
+class ImagePasteTests(unittest.TestCase):
+    def test_ctrl_v_uploads_clipboard_image_for_remote_panes(self):
+        from unittest import mock
+        from crowcli import clipimage
+        from crowcli.client import Client, PaneRuntime
+        sent = []
+
+        class Conn(object):
+            def send(self, kind, data):
+                sent.append(data)
+        uploads = []
+
+        def target(pane_meta, window_meta):
+            if not window_meta.get("remote_host"):
+                return None
+            return lambda data: uploads.append(data) or \
+                "/tmp/crow-clipboard-x/image.png"
+        client = Client(object(), image_target=target)
+        client._winsize = lambda: (80, 24)
+        local = PaneRuntime({"id": "p", "name": "pane0"}, {"meta": {}})
+        local.conn = Conn()
+        client.runtimes, client.active_id = [local], "p"
+        client._input(b"\x16", {})
+        self.assertEqual(sent, [b"\x16"])  # local: Ctrl-V passes through
+        del sent[:]
+        remote = PaneRuntime({"id": "p", "name": "pane0"},
+                             {"meta": {"remote_host": "u@h"}})
+        remote.conn = Conn()
+        client.runtimes = [remote]
+        with mock.patch.object(clipimage, "read_png",
+                               return_value=clipimage.PNG_MAGIC + b"x"):
+            client._input(b"\x16", {})
+            for _ in range(100):
+                if client._paste_queue:
+                    break
+                time.sleep(0.01)
+        client._flush_pastes()
+        self.assertEqual(uploads, [clipimage.PNG_MAGIC + b"x"])
+        self.assertEqual(sent, [b"/tmp/crow-clipboard-x/image.png "])
+        self.assertIn("이미지 첨부", client._bar_text(80)[0])
+        with mock.patch.object(clipimage, "read_png", return_value=None):
+            client._input(b"\x16", {})
+            for _ in range(100):
+                if client._paste_queue:
+                    break
+                time.sleep(0.01)
+        client._flush_pastes()
+        self.assertEqual(sent[-1], b"\x16")  # no image: ordinary Ctrl-V
+
+    def test_pasted_path_quotes_unsafe_paths(self):
+        from crowcli import clipimage
+        self.assertEqual(clipimage.pasted_path("/tmp/a.png"), "/tmp/a.png ")
+        self.assertEqual(clipimage.pasted_path("/tmp/it's x.png"),
+                         "'/tmp/it'\\''s x.png' ")
+        with self.assertRaises(ValueError):
+            clipimage.validate(b"GIF89a")
+
+
+class WindowTabTests(unittest.TestCase):
+    def test_bar_shows_clickable_window_tabs(self):
+        from crowcli.client import Client
+        client = Client(object(), status_provider=lambda: " demo | shell ",
+                        windows_provider=lambda: [("main", False),
+                                                  ("logs", True),
+                                                  ("build", False)])
+        client._winsize = lambda: (100, 24)
+        bar = client._bar_chunk()
+        self.assertIn(b"\x1b[0;1;48;5;45;38;5;16m 1:logs ", bar)  # current
+        self.assertIn(b" 0:main ", bar)
+        tabs = [b for b in client._bar_buttons
+                if b[2] not in ("explorer", "sidebar")]
+        self.assertEqual([b[2] for b in tabs],
+                         [("window", 0), ("window", 1), ("window", 2)])
+        # Tabs follow the session block (one gap cell); hints sit flush right.
+        session_end = len(" Hosts ▾") + len(" Files ") + len(" demo | shell ")
+        self.assertEqual(tabs[0][0], session_end + 2)
+        self.assertIn(client.SESSION_STYLE + b" demo | shell ", bar)
+        self.assertTrue(bar.endswith(b"C-b ? help \x1b[0m"))
+        x = tabs[2][0] + 1
+        click = ("\x1b[<0;%d;24M\x1b[<0;%d;24m" % (x, x)).encode()
+        result = client._input(click, {})
+        self.assertEqual((result.action, result.arg), ("switch", ("index", 2)))
+
+    def test_hosts_button_toggles_the_sidebar(self):
+        from crowcli.client import Client
+        client = Client(object())
+        client._winsize = lambda: (100, 24)
+        client._sidebar_data = {"sessions": [], "hosts": []}
+        client._refresh_sidebar = lambda: None
+        try:
+            self.assertEqual(client._area()[0], 28)  # sidebar shown
+            client._bar_chunk()
+            hosts = [b for b in client._bar_buttons if b[2] == "sidebar"][0]
+            click = ("\x1b[<0;%d;24M" % hosts[0]).encode()
+            client._input(click, {})
+            self.assertFalse(Client.sidebar_open)
+            self.assertEqual(client._area()[0], 0)  # panes take the width
+            self.assertEqual(client._sidebar_chunk(), b"")
+            self.assertIn(b" Hosts ", client._bar_chunk())
+            client._input(click, {})
+            self.assertTrue(Client.sidebar_open)
+            self.assertIn(b" Hosts \xe2\x96\xbe", client._bar_chunk())
+            client.explorer_open = True  # Hosts takes the left side back
+            client._input(click, {})
+            self.assertFalse(client.explorer_open)
+            self.assertTrue(Client.sidebar_open)
+        finally:
+            Client.sidebar_open = True
+
+
+class PanelWidthTests(unittest.TestCase):
+    """Korean labels are 2 cells wide: panel rows must not protrude."""
+
+    @staticmethod
+    def _display_width(chunk):
+        import re as _re
+        from crowcli.vt import char_width
+        text = _re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", chunk.decode())
+        return sum(char_width(c) for c in text)
+
+    def test_reverse_panel_rows_are_exact_width(self):
+        from crowcli.client import Client
+        client = Client(object())
+        client.reverse_open = True
+        client._pending_local = True
+        client.reverse_data = {"hosts": []}
+        area_w = client._area()[2]
+        width = min(40, area_w)
+        area_h = client._area()[3]
+        chunk = client._reverse_chunk()
+        # title + subtitle + visible rows + bottom, each exactly `width`
+        self.assertEqual(self._display_width(chunk), width * area_h)
+
+    def test_explorer_panel_rows_are_exact_width(self):
+        from crowcli.client import Client
+        client = Client(object())
+        client.explorer_open = True
+        client.explorer_path = "/tmp/한글폴더"
+        client.explorer_entries = [("긴한글이름파일.txt", False,
+                                    "/tmp/한글폴더/긴한글이름파일.txt"),
+                                   ("폴더", True, "/tmp/한글폴더/폴더")]
+        area_w = client._area()[2]
+        width = min(40, area_w)
+        area_h = client._area()[3]
+        chunk = client._explorer_chunk()
+        self.assertEqual(self._display_width(chunk), width * area_h)
+
+    def test_explorer_and_sidebar_never_show_together(self):
+        from crowcli.client import Client
+        client = Client(object(), sidebar_data_provider=lambda: {
+            "sessions": [], "hosts": [{"name": "mac", "address": "u@h"}]})
+        self.assertNotEqual(client._sidebar_chunk(), b"")
+        self.assertEqual(client._area()[0], 28)
+        client.explorer_open = True
+        self.assertEqual(client._sidebar_chunk(), b"")
+        self.assertEqual(client._area()[0], 0)  # panes get full width
+        client.explorer_open = False
+        self.assertEqual(client._area()[0], 28)
+
+    def test_pad_measures_display_width(self):
+        from crowcli.client import Client
+        client = Client(object())
+        self.assertEqual(client._width(client._pad(" 리버스 에이전트", 38, "─")), 38)
+        self.assertEqual(client._width(client._pad("대상: 로컬 샌드박스", 38)), 38)
+
+
+class KoreanPrefixTests(unittest.TestCase):
+    """두벌식 IME: prefix commands must work without switching to English."""
+
+    def test_jamo_maps_to_prefix_keys(self):
+        from crowcli.client import Client, latin_key
+        self.assertEqual(latin_key("ㅇ"), "d")
+        self.assertEqual(latin_key("ㄷ"), "e")
+        self.assertEqual(latin_key("d"), "d")
+        client = Client(object())
+        client._prefix_pending = True
+        result = client._input("ㅇ".encode(), {})
+        self.assertEqual(result.action, "detach")
+        client._prefix_pending = True
+        result = client._input("ㅊ".encode(), {})
+        self.assertEqual(result.action, "new")
+
+    def test_jamo_in_panels(self):
+        from crowcli.client import Client
+        client = Client(object())
+        client._prefix_pending = True
+        client._input("ㄷ".encode(), {})  # physical E opens the explorer
+        self.assertTrue(client.explorer_open)
+        client._explorer_key("ㅂ".encode())  # physical Q closes it
+        self.assertFalse(client.explorer_open)
+
+    def test_prefix_switches_ime_to_latin_and_back(self):
+        from unittest import mock
+        from crowcli import client as client_mod
+        calls = []
+        with mock.patch.object(client_mod.imswitch, "to_latin",
+                               lambda: calls.append("latin") or "KO"), \
+                mock.patch.object(client_mod.imswitch, "restore",
+                                  lambda sid: calls.append(sid)):
+            client = client_mod.Client(object())
+            client._input(b"\x02", {})
+            self.assertEqual(calls, ["latin"])
+            client._input(b"z", {})  # command done: back to Korean
+            self.assertEqual(calls, ["latin", "KO"])
+            client._input(b"\x02", {})
+            client._input(b"e", {})  # explorer stays in ABC while open
+            self.assertEqual(calls, ["latin", "KO", "latin"])
+            client._explorer_key(b"q")
+            client._input(b"\x1b[A", {})
+            self.assertEqual(calls[-1], "KO")
+
