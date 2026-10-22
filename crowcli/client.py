@@ -1004,12 +1004,14 @@ class Client(object):
         # buffer, so prefix mode (and panels opened from it) runs in ABC.
         if self._ime_saved and not (
                 self._prefix_pending or self.reverse_open
+                or self.form is not None
                 or (self.explorer_open and self.explorer_focus)):
             self._restore_ime()
         return result
 
     def _unit_inner(self, unit, rects):
         if self.form is not None:
+            self._focus_dirty = True
             return self._form_key(unit)
         if self.help_open and not self._prefix_pending:
             mouse = MOUSE_RE.match(unit)
@@ -1797,9 +1799,12 @@ class Client(object):
             if key is None:
                 keys.append((os.path.basename(identity), identity))
                 key = len(keys) - 1
-        self.form = {"address": host.get("address", ""),
-                     "port": str(host["port"]) if host.get("port") else "",
-                     "keys": keys, "key": key, "edit": host.get("name"),
+        address = host.get("address", "")
+        port = str(host["port"]) if host.get("port") else ""
+        self.form = {"address": address, "port": port,
+                     "caret": {"address": len(address), "port": len(port)},
+                     "view": {}, "keys": keys, "key": key,
+                     "edit": host.get("name"),
                      "focus": 0, "error": None, "opened": time.time(),
                      "cursor": None, "hits": []}
         self.explorer_open = False
@@ -1846,6 +1851,9 @@ class Client(object):
                 for row, x0, x1, field in form["hits"]:
                     if gy == row and x0 <= gx < x1:
                         form["focus"] = self.FORM_FIELDS.index(field)
+                        if field in form["caret"]:
+                            form["caret"][field] = self._form_click_caret(
+                                form, field, gx)
                         if field == "save":
                             return self._form_submit()
                         if field == "cancel":
@@ -1873,18 +1881,39 @@ class Client(object):
         if unit in (b"\x1b[Z", b"\x1b[A"):
             form["focus"] = (form["focus"] - 1) % len(self.FORM_FIELDS)
             return None
+        caret = form["caret"]
         if unit in (b"\x1b[C", b"\x1b[D"):
             step = 1 if unit == b"\x1b[C" else -1
             if field == "key":
                 form["key"] = (form["key"] + step) % len(form["keys"])
             elif field in ("save", "cancel"):
                 form["focus"] = 3 if field == "cancel" else 4
+            else:
+                caret[field] = max(0, min(len(form[field]),
+                                          caret[field] + step))
             return None
         if field not in ("address", "port"):
             return None
+        value, at = form[field], min(caret[field], len(form[field]))
+        if unit in (b"\x1b[H", b"\x1bOH", b"\x1b[1~", b"\x01"):
+            caret[field] = 0
+            return None
+        if unit in (b"\x1b[F", b"\x1bOF", b"\x1b[4~", b"\x05"):
+            caret[field] = len(value)
+            return None
         if unit in (b"\x7f", b"\x08"):
-            form[field] = form[field][:-1]
+            if at:
+                form[field] = value[:at - 1] + value[at:]
+                caret[field] = at - 1
             form["error"] = None
+            return None
+        if unit in (b"\x1b[3~", b"\x04"):
+            form[field] = value[:at] + value[at + 1:]
+            form["error"] = None
+            return None
+        if unit == b"\x15":  # ^U: clear before the caret
+            form[field] = value[at:]
+            caret[field] = 0
             return None
         if unit.startswith(b"\x1b"):
             return None  # bracketed-paste markers and other sequences
@@ -1894,9 +1923,22 @@ class Client(object):
         elif text.isspace():
             text = ""
         if text and text.isprintable():
-            form[field] += text
+            form[field] = value[:at] + text + value[at:]
+            caret[field] = at + len(text)
             form["error"] = None
         return None
+
+    def _form_click_caret(self, form, field, gx):
+        """Caret index for a click at 1-based column gx in a text field."""
+        col0, start = form["view"].get(field, (gx, 0))
+        value, x, index = form[field], col0, start
+        while index < len(value):
+            w = self._width(value[index])
+            if x + w > gx:
+                break
+            x += w
+            index += 1
+        return index
 
     def _form_lines(self, form, top, left, inner, body, dim):
         """Rows inside the box, each styled and exactly `inner` wide.
@@ -1917,11 +1959,21 @@ class Client(object):
                                                else (237, 250))
             text_style = "\x1b[0;48;5;%d;38;5;242m" % (238 if on else 237) \
                 if empty else base
-            while self._width(shown) > field_w - 2 and len(shown) > 1:
-                shown = shown[1:]  # keep the tail visible while typing
-            if on and name != "key":
-                form["cursor"] = (row, col + 1
-                                  + (0 if empty else self._width(shown)))
+            limit = field_w - 2
+            if name in form["caret"]:
+                value = form[name]
+                caret = min(form["caret"][name], len(value))
+                start = min(form["view"].get(name, (0, 0))[1], caret)
+                while self._width(value[start:caret]) > limit:
+                    start += 1  # scroll so the caret stays visible
+                form["view"][name] = (col + 1, start)
+                if not empty:
+                    shown = value[start:]
+                if on:
+                    form["cursor"] = (row, col + 1 + (0 if empty else
+                                      self._width(value[start:caret])))
+            while self._width(shown) > limit and len(shown) > 1:
+                shown = shown[:-1]
             lines.append(body + "  "
                          + ("\x1b[1;48;5;235;38;5;51m" if on else body)
                          + self._pad(label, label_w) + text_style + " "

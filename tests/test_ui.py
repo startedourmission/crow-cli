@@ -344,6 +344,66 @@ class HostFormTests(unittest.TestCase):
         self.assertEqual(client.reverse_stage, "menu")
         self.assertEqual(client._pending_host["name"], "mac")
 
+    def test_caret_moves_and_edits_mid_text(self):
+        from crowcli.vt import Screen
+        client = self.make_client([])
+        client._open_host_form()
+        client.form["opened"] = 0
+        for unit in [b"r", b"x", b"t", b"@", b"b", b"x"] + [b"\x1b[D"] * 5 \
+                + [b"\x1b[3~", b"o", b"o"]:
+            client._input(unit, {})
+            self.assertTrue(client._focus_dirty)  # repaint right away
+        self.assertEqual(client.form["address"], "root@bx")
+        self.assertEqual(client.form["caret"]["address"], 3)
+        client._input(b"\x7f", {})
+        client._input(b"o", {})
+        self.assertEqual(client.form["address"], "root@bx")
+        client._input(b"\x1b[F", {})
+        for _ in range(2):
+            client._input(b"\x7f", {})
+        client._input(b"x", {})
+        self.assertEqual(client.form["address"], "root@x")
+        client.form["address"] = "root@bx"
+        client.form["caret"]["address"] = 7
+        client._input(b"\x01", {})  # ^A, then backspace at 0 is a no-op
+        client._input(b"\x7f", {})
+        client._input(b"\x1b[C", {})
+        client._input(b"\x7f", {})
+        self.assertEqual(client.form["address"], "oot@bx")
+        client._input(b"\x1b[F", {})
+        client._input(b"!", {})
+        self.assertEqual(client.form["address"], "oot@bx!")
+        client._input(b"\x1b[H", {})
+        client._input(b"\x1b[C", {})
+        screen = Screen(100, 30)
+        screen.feed(client._form_chunk())
+        row, col = client.form["cursor"]
+        cells = [c[0] for c in screen.grid[row - 1]]
+        self.assertEqual("".join(cells[col - 1:col + 5]), "ot@bx!")
+        # A click lands the caret under the pointer.
+        click = ("\x1b[<0;%d;%dM" % (col + 3, row)).encode()
+        client._input(click, {})
+        self.assertEqual(client.form["caret"]["address"], 4)
+
+    def test_long_address_scrolls_to_caret(self):
+        from crowcli.vt import Screen
+        client = self.make_client([])
+        client._open_host_form()
+        client.form["opened"] = 0
+        long = "user@" + "a" * 80 + ".example.com"
+        client._input(long.encode(), {})
+        screen = Screen(100, 30)
+        screen.feed(client._form_chunk())
+        row, col = client.form["cursor"]
+        cells = [c[0] for c in screen.grid[row - 1]]
+        self.assertTrue("".join(cells[:col - 1]).endswith("example.com"))
+        client._input(b"\x01", {})
+        screen = Screen(100, 30)
+        screen.feed(client._form_chunk())
+        row, col = client.form["cursor"]
+        cells = [c[0] for c in screen.grid[row - 1]]
+        self.assertEqual("".join(cells[col - 1:col + 4]), "user@")
+
     def test_edit_keeps_unlisted_key(self):
         client = self.make_client([])
         client._open_host_form({"name": "mac", "address": "a@b",
