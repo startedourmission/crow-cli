@@ -40,6 +40,7 @@ HELP_KEYS = [
     (",  $", "윈도우 / 세션 이름"),
     ("e", "파일 탐색기"),
     ("a", "호스트 · 리버스"),
+    ("h", "사이드바 키보드 조작 (호스트·세션·키)"),
     ("C-b", "Ctrl-B 그대로 보내기"),
 ]
 
@@ -569,11 +570,29 @@ class Client(object):
         lines.append((" + 새 키 만들기…", "38;5;31;" + bg,
                       ("key-generate", None)))
         lines.append((" ⋯ 키 목록·관리", "38;5;31;" + bg, ("keys", None)))
+        items = []
+        for _text, _style, action in lines:
+            if action and (not items or self._action_key(items[-1])
+                           != self._action_key(action)):
+                items.append(action)
+        self._sidebar_items = items
+        picked = None
+        if self.sidebar_focus and items:
+            keys = [self._action_key(a) for a in items]
+            if self._sidebar_pick in keys:
+                self._sidebar_sel = keys.index(self._sidebar_pick)
+            self._sidebar_sel = max(0, min(self._sidebar_sel,
+                                           len(items) - 1))
+            picked = keys[self._sidebar_sel]
+            self._sidebar_pick = picked
         out = []
         self._sidebar_rows = []
         for row in range(area_h):
             text, style, action = lines[row] if row < len(lines) \
                 else ("", plain, None)
+            if picked is not None and action and \
+                    self._action_key(action) == picked:
+                style = "1;38;5;231;48;5;31"
             fitted, _used = self._fit(text, content)
             out.append(("\x1b[%d;1H\x1b[%sm" % (row + 1, style)).encode()
                        + fitted.encode()
@@ -583,18 +602,93 @@ class Client(object):
         return b"".join(out)
 
     def _sidebar_click(self, gy):
-        for row, (kind, arg) in self._sidebar_rows:
+        for row, action in self._sidebar_rows:
             if row == gy - 1:
-                if kind == "switch-session":
-                    return AttachResult("switch-session", arg)
-                if kind == "reverse-host":
-                    self._open_reverse_for_host(arg)
-                elif kind == "add-host":
-                    self._open_host_form()
-                elif kind in ("key", "keys"):
-                    self._open_keys(arg)
-                elif kind == "key-generate":
-                    return AttachResult("key-generate", None)
+                return self._sidebar_activate(action)
+        return None
+
+    def _sidebar_activate(self, action):
+        kind, arg = action
+        if kind == "switch-session":
+            return AttachResult("switch-session", arg)
+        if kind == "reverse-host":
+            self._open_reverse_for_host(arg)
+        elif kind == "add-host":
+            self._open_host_form()
+        elif kind in ("key", "keys"):
+            self._open_keys(arg)
+        elif kind == "key-generate":
+            return AttachResult("key-generate", None)
+        return None
+
+    @staticmethod
+    def _action_key(action):
+        kind, arg = action
+        if isinstance(arg, dict):
+            arg = arg.get("name") or arg.get("path")
+        return kind, arg
+
+    # Keyboard focus on the left sidebar (C-b h). Panels and the host
+    # form opened from it take the keys first; closing them lands back
+    # here.
+    sidebar_focus = False
+    _sidebar_sel = 0
+    _sidebar_pick = None
+    _sidebar_items = ()
+
+    def _focus_sidebar(self):
+        if self.explorer_open:
+            self.explorer_open = False
+        Client.sidebar_open = True
+        self.sidebar_focus = True
+        self._sidebar_pick = None
+        hosts = self._sidebar_data.get("hosts") or []
+        self._sidebar_sel = 0
+        if hosts:
+            self._sidebar_pick = ("reverse-host", hosts[0].get("name"))
+        else:
+            self._sidebar_pick = ("add-host", None)
+        if self._ime_saved is None:
+            self._ime_saved = imswitch.to_latin()
+        self._focus_dirty = True
+
+    def _leave_sidebar(self):
+        self.sidebar_focus = False
+        self._focus_dirty = True
+
+    def _sidebar_key(self, unit):
+        items = list(self._sidebar_items)
+        if not Client.sidebar_open or self.explorer_open:
+            self._leave_sidebar()
+            return None
+        self._focus_dirty = True
+        key = None if unit.startswith(b"\x1b") and len(unit) > 1 else \
+            latin_key(unit.decode(errors="ignore"))
+        final = unit[-1:] if unit.startswith(b"\x1b[") or \
+            unit.startswith(b"\x1bO") else b""
+        step = -1 if final == b"A" or key == "k" else \
+            1 if final == b"B" or key == "j" else 0
+        if step and items:
+            self._sidebar_sel = (self._sidebar_sel + step) % len(items)
+            self._sidebar_pick = self._action_key(items[self._sidebar_sel])
+            return None
+        if key in ("\x1b", "q") or final == b"D" or key == "h":
+            self._leave_sidebar()
+            return None
+        if not items:
+            return None
+        action = items[min(self._sidebar_sel, len(items) - 1)]
+        if key in ("\r", "\n", "l", " ") or final == b"C":
+            return self._sidebar_activate(action)
+        if key == "a":
+            self._open_host_form()
+        elif action[0] == "reverse-host" and key == "e":
+            self._open_host_form(action[1])
+        elif action[0] == "reverse-host" and key in ("d", "x"):
+            self._open_reverse_for_host(action[1])
+            self.reverse_stage = "host-delete"
+        elif action[0] == "reverse-host" and key == "s":
+            return AttachResult("ssh-connect", action[1])
         return None
 
     def _open_keys(self, key=None):
@@ -652,6 +746,9 @@ class Client(object):
         if self._paste_msg and time.time() < self._paste_msg[1]:
             left = " %s " % self._paste_msg[0]
         right = " %s | C-b d detach | C-b ? help " % time.strftime("%H:%M")
+        if self.sidebar_focus and not self.reverse_open and self.form is None:
+            right = " ↑↓ 이동 · Enter 열기 · a 추가 · e 수정 · d 삭제 · " \
+                "s SSH · Esc 나가기 "
         cols = width if width is not None else self._winsize()[0]
         if self._width(left) + self._width(right) > cols:
             # Shrink the hints before truncating session/window names.
@@ -784,8 +881,8 @@ class Client(object):
         chunks.append(self._park_cursor(rect, screen))
         if rect and screen.cursor_visible and active.view_offset == 0 \
                 and not ((self.explorer_open and self.explorer_focus)
-                         or self.reverse_open or self.help_open
-                         or self.form is not None):
+                        or self.reverse_open or self.help_open
+                        or self.sidebar_focus or self.form is not None):
             chunks.append(b"\x1b[?25h")
         else:
             chunks.append(b"\x1b[?25l")
@@ -1004,7 +1101,7 @@ class Client(object):
         # buffer, so prefix mode (and panels opened from it) runs in ABC.
         if self._ime_saved and not (
                 self._prefix_pending or self.reverse_open
-                or self.form is not None
+                or self.form is not None or self.sidebar_focus
                 or (self.explorer_open and self.explorer_focus)):
             self._restore_ime()
         return result
@@ -1042,6 +1139,8 @@ class Client(object):
             return self._reverse_key(unit)
         if self.explorer_open and self.explorer_focus:
             return self._explorer_key(unit)
+        if self.sidebar_focus:
+            return self._sidebar_key(unit)
         active = self._active()
         if unit == b"\x16" and self._start_image_paste(active):
             return None
@@ -1147,6 +1246,8 @@ class Client(object):
                 and button not in (64, 65):
             self.explorer_focus = False  # keys go to the clicked pane
             self._focus_dirty = True
+        if self.sidebar_focus and final == b"M" and button not in (64, 65):
+            self._leave_sidebar()
         for pane_id, (x, y, w, h) in rects.items():
             if not (x < gx <= x + w and y < gy <= y + h):
                 continue
@@ -2168,6 +2269,12 @@ class Client(object):
             return None
         if key == "a":
             self._toggle_reverse()
+            return None
+        if key == "h":
+            if self.sidebar_focus:
+                self._leave_sidebar()
+            else:
+                self._focus_sidebar()
             return None
         if key == "c":
             return AttachResult("new")

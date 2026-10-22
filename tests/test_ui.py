@@ -494,6 +494,104 @@ class HostFormTests(unittest.TestCase):
         self.assertIsNone(client.form)
 
 
+class SidebarKeyboardTests(unittest.TestCase):
+    def setUp(self):
+        from unittest import mock
+        from crowcli import imswitch
+        patcher = mock.patch.multiple(imswitch, to_latin=lambda: None,
+                                      restore=lambda _id: None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def make_client(self):
+        from crowcli.client import Client
+        self.hosts = [{"name": "mac", "address": "u@192.0.2.1"},
+                      {"name": "집", "address": "me@192.0.2.2"}]
+        client = Client(object(), sidebar_data_provider=lambda: {
+            "sessions": [{"name": "main", "current": True},
+                         {"name": "work"}],
+            "hosts": list(self.hosts), "keys": []},
+            host_form={"keys": lambda: [], "derive": lambda a: a,
+                       "save": None, "delete": None})
+        client._winsize = lambda: (100, 30)
+        client._host_state = lambda host: ("연결됨", "32")
+        client._toggle_reverse = lambda: setattr(
+            client, "reverse_open", not client.reverse_open)
+        client._refresh_sidebar()
+        self.addCleanup(setattr, Client, "sidebar_open", Client.sidebar_open)
+        return client
+
+    def press(self, client, *units):
+        result = None
+        for unit in units:
+            client._sidebar_chunk()  # the loop repaints between keys
+            result = client._input(unit, {})
+        client._sidebar_chunk()
+        return result
+
+    def highlighted(self, client):
+        import re
+        chunk = client._sidebar_chunk().decode()
+        return [text.strip() for text in re.findall(
+            "\x1b\\[\\d+;1H\x1b\\[1;38;5;231;48;5;31m([^\x1b]*)", chunk)]
+
+    def test_prefix_h_focuses_first_host_and_moves(self):
+        client = self.make_client()
+        self.press(client, b"\x02", b"h")
+        self.assertTrue(client.sidebar_focus)
+        self.assertEqual(self.highlighted(client), ["● mac", "연결됨"])
+        self.press(client, b"j", b"j")
+        self.assertEqual(self.highlighted(client), ["+ 호스트 추가…"])
+        self.press(client, b"\x1b[A")
+        self.assertEqual(self.highlighted(client)[0], "● 집")
+        self.assertIn("Esc 나가기", client._bar_text()[1])
+        self.press(client, b"\r")
+        self.assertTrue(client.reverse_open)
+        self.assertEqual(client._pending_host["name"], "집")
+        self.press(client, b"q")  # closing the panel lands back here
+        self.assertFalse(client.reverse_open)
+        self.assertTrue(client.sidebar_focus)
+        self.press(client, b"\x1b")
+        client._input(b"", {}, flush_esc=True)
+        self.assertFalse(client.sidebar_focus)
+
+    def test_host_shortcuts_and_session_switch(self):
+        client = self.make_client()
+        self.press(client, b"\x02", b"h", b"e")
+        self.assertEqual(client.form["edit"], "mac")
+        client._close_host_form()
+        self.press(client, b"d")
+        self.assertEqual(client.reverse_stage, "host-delete")
+        self.assertEqual(client._pending_host["name"], "mac")
+        self.press(client, b"q", b"q")  # confirm -> host menu -> closed
+        self.assertFalse(client.reverse_open)
+        self.assertEqual(self.press(client, b"s").arg["name"], "mac")
+        self.press(client, b"a")
+        self.assertIsNone(client.form["edit"])
+        client._close_host_form()
+        self.press(client, b"k")  # wraps up into the session list
+        result = self.press(client, b"\r")
+        self.assertEqual(result.action, "switch-session")
+        self.assertEqual(result.arg, "work")
+        # Korean IME keys map to the same commands.
+        self.press(client, "ㅓ".encode())
+        self.assertEqual(self.highlighted(client)[0], "● mac")
+
+    def test_deleted_host_keeps_selection_in_range(self):
+        client = self.make_client()
+        self.press(client, b"\x02", b"h", b"j")
+        self.hosts.pop()
+        client._sidebar_at = 0.0
+        client._refresh_sidebar()
+        self.assertEqual(self.highlighted(client)[0], "+ 호스트 추가…")
+
+    def test_pane_click_leaves_sidebar(self):
+        client = self.make_client()
+        self.press(client, b"\x02", b"h")
+        client._input(b"\x1b[<0;60;5M", {})
+        self.assertFalse(client.sidebar_focus)
+
+
 class ImagePasteTests(unittest.TestCase):
     def test_ctrl_v_uploads_clipboard_image_for_remote_panes(self):
         from unittest import mock
