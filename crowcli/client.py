@@ -45,6 +45,7 @@ HELP_KEYS = [
 
 MOUSE_RE = re.compile(rb"^\x1b\[<(\d+);(\d+);(\d+)([Mm])$")
 ARROW_RE = re.compile(rb"^\x1b[\[O][ABCD]$")
+OSC_COLOUR_RE = re.compile(rb"\x1b\](1[01]);(rgb:[0-9a-fA-F/]+)(?:\x07|\x1b\\)")
 
 KOREAN_TO_KEY = dict(pair.split(":") for pair in (
     "ㄱ:r ㄲ:r ㄴ:s ㄷ:e ㄸ:e ㄹ:f ㅁ:a ㅂ:q ㅃ:q ㅅ:t ㅆ:t ㅇ:d "
@@ -184,6 +185,7 @@ class Client(object):
         self._last_bar = 0.0
         self._prefix_pending = False
         self._repeat_until = 0.0  # tmux repeat-time after C-b arrow
+        self._early_input = b""  # keys typed during the colour probe
         self._ime_saved = None
         self._stdin_buf = b""
         self._stdin_since = 0.0
@@ -268,6 +270,7 @@ class Client(object):
             out.write(b"\x1b[?1049h\x1b[?25l\x1b[?1002h\x1b[?1006h"
                       + ("\x1b[1;%dr" % max(1, rows - 1)).encode())
             out.flush()
+            self._probe_outer_colors(out, stdin_fd)
             for runtime in self.runtimes:
                 rect = rects.get(runtime.id)
                 if rect:
@@ -292,6 +295,27 @@ class Client(object):
             out.flush()
             signal.signal(signal.SIGWINCH, old_handler)
             termios.tcsetattr(stdin_fd, termios.TCSANOW, old)
+
+    _colors_probed = False  # class-wide: once per crow process
+
+    def _probe_outer_colors(self, out, stdin_fd):
+        """Ask the real terminal for its default fg/bg (OSC 10/11) so
+        panes asking the same get the truth, not a dark-theme guess."""
+        if Client._colors_probed:
+            return
+        Client._colors_probed = True
+        out.write(b"\x1b]10;?\x07\x1b]11;?\x07")
+        out.flush()
+        buf, deadline, colours = b"", time.time() + 0.3, {}
+        while len(colours) < 2 and time.time() < deadline:
+            if not select.select([stdin_fd], [], [],
+                                 max(0, deadline - time.time()))[0]:
+                break
+            buf += os.read(stdin_fd, 4096)
+            for match in OSC_COLOUR_RE.finditer(buf):
+                colours[match.group(1).decode()] = match.group(2).decode()
+        Screen.term_colors = colours
+        self._early_input = OSC_COLOUR_RE.sub(b"", buf)
 
     def _on_resize(self, _signo, _frame):
         self._resize = True
@@ -811,6 +835,11 @@ class Client(object):
         rects = self._rects()
         self._render(out, rects, force=True)
         sockets = dict((r.conn.sock, r) for r in self.runtimes)
+        if self._early_input:
+            early, self._early_input = self._early_input, b""
+            result = self._input(early, rects)
+            if result is not None:
+                return result
         paint_due = False  # coalesce pane output into ~60fps paints
         while True:
             if self._resize:
@@ -850,6 +879,8 @@ class Client(object):
                         if runtime.awaiting_replay and payload != b"\x1bc":
                             runtime.awaiting_replay = False
                             runtime.screen.feed_replay(payload)
+                            # queries in old output were answered back then
+                            runtime.screen.responses = []
                         else:
                             runtime.screen.feed(payload)
                         changed = True

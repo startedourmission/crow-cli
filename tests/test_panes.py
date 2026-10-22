@@ -115,6 +115,21 @@ class VtTests(unittest.TestCase):
         self.assertEqual(rows[1], "가나다")  # "fg" wrapped, overwritten
         self.assertEqual((screen.cx, screen.cy), (3, 0))
 
+    def test_colour_queries_get_the_outer_terminals_colours(self):
+        screen = Screen(10, 2)
+        screen.feed(b"\x1b]11;?\x07")
+        self.assertEqual(screen.responses, [])  # unknown: stay silent
+        Screen.term_colors = {"10": "rgb:0000/0000/0000",
+                              "11": "rgb:ffff/ffff/ffff"}
+        try:
+            screen.feed(b"\x1b]11;?\x07ab\x1b]10;?\x1b\\\x1b]0;title\x07")
+        finally:
+            Screen.term_colors = {}
+        self.assertEqual(screen.responses, [
+            b"\x1b]11;rgb:ffff/ffff/ffff\x07",
+            b"\x1b]10;rgb:0000/0000/0000\x1b\\"])
+        self.assertEqual("".join(c[0] for c in screen.grid[0][:2]), "ab")
+
     def test_keyboard_mode_sequences_are_not_styles(self):
         screen = Screen(10, 1)
         screen.feed(b"ab\x1b[s\x1b[>4;2m\x1b[>4m\x1b[>1u\x1b[<u\x1b[>0qcd")

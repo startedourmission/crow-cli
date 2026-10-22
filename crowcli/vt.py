@@ -40,13 +40,18 @@ REPLAY_SKIP_MIN = 256 * 1024
 
 
 class Screen(object):
+    # {"10": "rgb:0000/0000/0000", "11": "rgb:ffff/ffff/ffff"}: the outer
+    # terminal's default fg/bg, set by the attach client.
+    term_colors = {}
+
     def __init__(self, cols=80, rows=24):
         self.cols = max(1, cols)
         self.rows = max(1, rows)
         self.decoder = codecs.getincrementaldecoder("utf-8")("replace")
         self.state = "ground"
         self.csi = ""
-        self.osc = False
+        self.osc = False  # the escape-string body being read is an OSC
+        self.osc_buf = ""
         self.esc_intermediate = ""
         self.grid = [self._line() for _ in range(self.rows)]
         self.scrollback = []
@@ -179,11 +184,19 @@ class Screen(object):
         if self.state == "osc":
             if char == "\x07":
                 self.state = "ground"
+                self._osc_end("\x07")
             elif char == "\x1b":
                 self.state = "esc_string"
+            elif len(self.osc_buf) < 256:
+                self.osc_buf += char
             return
         if self.state == "esc_string":  # string terminator after ESC
-            self.state = "ground" if char == "\\" else "osc"
+            if char == "\\":
+                self.state = "ground"
+                if self.osc:
+                    self._osc_end("\x1b\\")
+            else:
+                self.state = "osc" if self.osc else "string"
             return
         if self.state == "string":  # DCS/SOS/PM/APC body
             if char == "\x1b":
@@ -197,9 +210,9 @@ class Screen(object):
             self.state = "csi"
             self.csi = ""
         elif char in ("\x90", "\x98", "\x9e", "\x9f"):
-            self.state = "string"
+            self.state, self.osc = "string", False
         elif char == "\x9d":
-            self.state = "osc"
+            self.state, self.osc, self.osc_buf = "osc", True, ""
         elif char == "\r":
             self.cx = 0
             self.wrap_pending = False
@@ -219,6 +232,18 @@ class Screen(object):
         else:
             self._print(char)
 
+    def _osc_end(self, terminator):
+        code, _, value = self.osc_buf.partition(";")
+        self.osc_buf = ""
+        # Default fg/bg queries: TUIs (Cursor Agent, Codex...) pick a
+        # light or dark theme from these, so answer with the outer
+        # terminal's real colours when the client could learn them.
+        if value == "?" and code in ("10", "11"):
+            colour = self.term_colors.get(code)
+            if colour:
+                self.responses.append(("\x1b]%s;%s%s" % (
+                    code, colour, terminator)).encode())
+
     def _escape(self, char):
         if self.esc_intermediate:
             self.esc_intermediate = ""
@@ -232,9 +257,9 @@ class Screen(object):
             self.state = "csi"
             self.csi = ""
         elif char == "]":
-            self.state = "osc"
+            self.state, self.osc, self.osc_buf = "osc", True, ""
         elif char in "PX^_":
-            self.state = "string"
+            self.state, self.osc = "string", False
         elif char == "c":
             self._reset()
         elif char == "7":
