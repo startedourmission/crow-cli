@@ -87,6 +87,34 @@ class VtTests(unittest.TestCase):
         self.assertEqual(screen.grid[0][2][0], "가")
         self.assertEqual(screen.grid[0][3][0], "")  # wide continuation
 
+    def test_replay_skips_to_last_clear_only_in_alt_screen(self):
+        def text(screen):
+            return ["".join(c[0] for c in row).rstrip()
+                    for row in screen.grid]
+        junk = b"\x1b[31mjunk \xed\x95\x9c\xea\xb8\x80\r\n" * 40000
+        alt = (b"\x1b[?1049h\x1b[?1h\x1b[?1002h" + junk
+               + b"\x1b[2J\x1b[Hhello \xed\x95\x9c\xea\xb8\x80")
+        fast, full = Screen(20, 5), Screen(20, 5)
+        fast.feed_replay(alt)
+        full.feed(alt)
+        self.assertEqual(text(fast), text(full))
+        self.assertEqual(text(fast)[0], "hello 한글")
+        self.assertTrue(fast.alt and fast.app_cursor)
+        self.assertEqual(fast.mouse_mode, full.mouse_mode)
+        shell = junk + b"\x1b[2J\x1b[Hprompt"  # main screen: no skip
+        fast, full = Screen(20, 5), Screen(20, 5)
+        fast.feed_replay(shell)
+        full.feed(shell)
+        self.assertEqual(len(fast.scrollback), len(full.scrollback))
+
+    def test_fast_path_matches_wrapping_and_wide_text(self):
+        screen = Screen(5, 3)
+        screen.feed("abcdefg\x1b[2;1H가나다\x1b[1;3Hz".encode())
+        rows = ["".join(c[0] for c in row) for row in screen.grid]
+        self.assertEqual(rows[0], "abzde")
+        self.assertEqual(rows[1], "가나다")  # "fg" wrapped, overwritten
+        self.assertEqual((screen.cx, screen.cy), (3, 0))
+
     def test_keyboard_mode_sequences_are_not_styles(self):
         screen = Screen(10, 1)
         screen.feed(b"ab\x1b[s\x1b[>4;2m\x1b[>4m\x1b[>1u\x1b[<u\x1b[>0qcd")

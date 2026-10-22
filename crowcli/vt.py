@@ -8,6 +8,8 @@ tracking, and DSR/DA replies. Each pane owns one Screen; the attach
 renderer composites the grids.
 """
 import codecs
+import functools
+import re
 import unicodedata
 
 DEFAULT_ATTR = (None, None, False, False, False, False, False, False)
@@ -19,10 +21,22 @@ def _blank(attr=DEFAULT_ATTR):
     return [" ", attr]
 
 
+@functools.lru_cache(maxsize=8192)
 def char_width(char):
     if unicodedata.combining(char):
         return 0
     return 2 if unicodedata.east_asian_width(char) in ("W", "F") else 1
+
+
+# Ground-state fast path: a run of printable ASCII, one complete CSI, or
+# a run of printable non-ASCII (Korean, box drawing...).
+_FAST = re.compile(r"[\x20-\x7e]+|\x1b\[([\x30-\x3f]*[\x20-\x2f]*)([\x40-\x7e])"
+                   r"|([\xa0-\U0010ffff]+)")
+# Replay pre-scan: alternate-screen switches, and the state a skipped
+# prefix must still apply (modes, keypad, scroll region).
+_ALT_SWITCH = re.compile(rb"\x1b\[\?(?:1049|1047|47)([hl])")
+_MODES = re.compile(rb"\x1b\[\?[\d;]*[hl]|\x1b[=>]|\x1b\[\d*(?:;\d*)?r")
+REPLAY_SKIP_MIN = 256 * 1024
 
 
 class Screen(object):
@@ -88,8 +102,62 @@ class Screen(object):
         return combined[max(0, end - self.rows):end]
 
     def feed(self, data):
-        for char in self.decoder.decode(data):
-            self._char(char)
+        text = self.decoder.decode(data)
+        i, end, fast = 0, len(text), _FAST.match
+        while i < end:
+            if self.state == "ground":
+                m = fast(text, i)
+                if m:
+                    if m.group(2):
+                        self._eol_candidate = None
+                        self._csi(m.group(1), m.group(2))
+                    elif m.group(3):
+                        for char in m.group(3):
+                            self._print(char)
+                    else:
+                        self._print_ascii(m.group())
+                    i = m.end()
+                    continue
+            self._char(text[i])
+            i += 1
+
+    def feed_replay(self, data):
+        """Attach replay: a full-screen app (alternate screen) repaints
+        everything after its last full clear, so for a big replay only
+        the modes of the part before it matter."""
+        cut = data.rfind(b"\x1b[2J") if len(data) > REPLAY_SKIP_MIN else -1
+        if cut > 0:
+            switches = _ALT_SWITCH.findall(data, 0, cut)
+            if switches and switches[-1] == b"h":
+                self.feed(b"".join(m.group() for m in
+                                   _MODES.finditer(data, 0, cut)))
+                if self.alt:
+                    self.feed(data[cut:])
+                    return
+                self._reset()
+        self.feed(data)
+
+    def _print_ascii(self, run):
+        pos, end = 0, len(run)
+        while pos < end:
+            if self.insert or self.wrap_pending \
+                    or self._eol_candidate is not None:
+                self._print(run[pos])
+                pos += 1
+                continue
+            line, x, attr = self.grid[self.cy], self.cx, self.attr
+            stop = min(end, pos + self.cols - x)
+            for char in run[pos:stop]:
+                line[x] = [char, attr]
+                x += 1
+            pos = stop
+            self.dirty.add(self.cy)
+            self.last_char = (self.cy, x - 1)
+            if x >= self.cols:
+                self.cx = self.cols - 1
+                self.wrap_pending = True
+            else:
+                self.cx = x
 
     def mark_clean(self):
         self.dirty = set()

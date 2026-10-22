@@ -101,6 +101,7 @@ class PaneRuntime(object):
         self.window = window
         self.conn = None
         self.screen = Screen()
+        self.awaiting_replay = False  # next non-reset "O" frame is replay
         self.dead_code = None
         self.view_offset = 0  # wheel scrollback view; 0 = live
 
@@ -271,6 +272,7 @@ class Client(object):
                 rect = rects.get(runtime.id)
                 if rect:
                     runtime.screen.resize(rect[2], rect[3])
+                runtime.awaiting_replay = True
                 runtime.conn.send("A")
                 if rect:
                     runtime.conn.send_size(rect[2], rect[3])
@@ -845,7 +847,11 @@ class Client(object):
                 runtime.conn.feed(data)
                 for kind, payload in runtime.conn.frames():
                     if kind == "O":
-                        runtime.screen.feed(payload)
+                        if runtime.awaiting_replay and payload != b"\x1bc":
+                            runtime.awaiting_replay = False
+                            runtime.screen.feed_replay(payload)
+                        else:
+                            runtime.screen.feed(payload)
                         changed = True
                         for response in runtime.screen.responses:
                             try:
