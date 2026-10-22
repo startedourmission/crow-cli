@@ -186,7 +186,12 @@ class Registry(object):
                 if s["name"] == name:
                     return s
             return None
-        return sessions[-1] if sessions else None
+        if not sessions:
+            return None
+        # Most recently used, like tmux: last attach (switches included)
+        # or creation, whichever is newer; ties go to the later entry.
+        return max(reversed(sessions), key=lambda s: max(
+            s.get("last_attached") or 0, s.get("created_at") or 0))
 
     def create_session(self, name, kind="local", meta=None):
         validate_name(name)

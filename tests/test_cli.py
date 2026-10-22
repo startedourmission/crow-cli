@@ -17,6 +17,22 @@ os.environ.setdefault("CROWCLI_NO_IME_SWITCH", "1")
 CROW = str(REPO / "crow")
 
 
+class DefaultSessionTests(unittest.TestCase):
+    def test_default_is_most_recently_used(self):
+        import sys
+        sys.path.insert(0, str(REPO))
+        from crowcli.registry import Registry
+        reg = Registry.__new__(Registry)
+        reg.data = {"sessions": [
+            {"name": "a", "created_at": 1, "last_attached": 50},
+            {"name": "b", "created_at": 2, "last_attached": 10},
+            {"name": "c", "created_at": 3, "last_attached": 0}]}
+        self.assertEqual(reg.find()["name"], "a")
+        reg.data["sessions"].append(
+            {"name": "d", "created_at": 60, "last_attached": 0})
+        self.assertEqual(reg.find()["name"], "d")  # created after
+
+
 class CliTests(unittest.TestCase):
     def setUp(self):
         self.home = tempfile.TemporaryDirectory(prefix="cch-", dir="/tmp")

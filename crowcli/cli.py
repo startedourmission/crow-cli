@@ -250,18 +250,20 @@ def pick_session(reg):
     sessions = reg.data["sessions"]
     if not sessions:
         return None
+    recent = reg.find()["name"]
     if len(sessions) == 1 or not sys.stdin.isatty():
-        return sessions[-1]["name"]
+        return recent
     for i, s in enumerate(sessions):
-        print(" %d) %s (%d windows, %s)" % (
-            i, s["name"], len(s["windows"]), s["kind"]))
+        print("%s%d) %s (%d windows, %s)" % (
+            "*" if s["name"] == recent else " ", i, s["name"],
+            len(s["windows"]), s["kind"]))
     try:
-        choice = input("session [last]: ").strip()
+        choice = input("session [%s]: " % recent).strip()
     except EOFError:
-        return sessions[-1]["name"]
+        return recent
     if choice.isdigit() and int(choice) < len(sessions):
         return sessions[int(choice)]["name"]
-    return choice or sessions[-1]["name"]
+    return choice or recent
 
 
 def ensure_reverse_forwards(session, window):
