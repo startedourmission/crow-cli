@@ -556,6 +556,37 @@ class KoreanPrefixTests(unittest.TestCase):
         result = client._input("ㅊ".encode(), {})
         self.assertEqual(result.action, "new")
 
+    def test_prefix_arrow_repeats_like_tmux(self):
+        from crowcli.client import Client
+        moves, sent = [], []
+
+        class Conn(object):
+            def send(self, kind, data=b""):
+                sent.append(data)
+
+        class Active(object):
+            conn = Conn()
+            pane = {}
+            meta = {}
+        client = Client(object())
+        client._focus_direction = lambda d, r: moves.append(d) or True
+        client._active = lambda: Active()
+        client._start_image_paste = lambda active: False
+        client._input(b"\x02\x1b[C", {})
+        client._input(b"\x1b[C", {})  # within repeat-time: no prefix
+        client._input(b"\x1b[B", {})
+        self.assertEqual(moves, ["right", "right", "down"])
+        self.assertEqual(sent, [])
+        client._input(b"x", {})  # any other key ends repeat mode
+        client._input(b"\x1b[C", {})
+        self.assertEqual(moves, ["right", "right", "down"])
+        client._repeat_until = 0.0
+        client._input(b"\x02\x1b[A", {})
+        client._repeat_until = 1.0  # expired
+        client._input(b"\x1b[A", {})
+        self.assertEqual(moves[-1:], ["up"])
+        self.assertEqual(len(moves), 4)
+
     def test_jamo_in_panels(self):
         from crowcli.client import Client
         client = Client(object())

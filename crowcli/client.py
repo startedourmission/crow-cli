@@ -30,7 +30,7 @@ HELP_KEYS = [
     ("d", "detach (세션 유지)"),
     ("%", "좌우로 분할"),
     ('"', "위아래로 분할"),
-    ("←↑↓→ o", "pane 이동"),
+    ("←↑↓→ o", "pane 이동 (방향키는 0.5초 안에 연타 가능)"),
     ("z", "pane 확대 / 복원"),
     ("x", "pane 닫기"),
     ("c", "새 윈도우"),
@@ -44,6 +44,7 @@ HELP_KEYS = [
 ]
 
 MOUSE_RE = re.compile(rb"^\x1b\[<(\d+);(\d+);(\d+)([Mm])$")
+ARROW_RE = re.compile(rb"^\x1b[\[O][ABCD]$")
 
 KOREAN_TO_KEY = dict(pair.split(":") for pair in (
     "ㄱ:r ㄲ:r ㄴ:s ㄷ:e ㄸ:e ㄹ:f ㅁ:a ㅂ:q ㅃ:q ㅅ:t ㅆ:t ㅇ:d "
@@ -181,6 +182,7 @@ class Client(object):
         self._outer_modes = None
         self._last_bar = 0.0
         self._prefix_pending = False
+        self._repeat_until = 0.0  # tmux repeat-time after C-b arrow
         self._ime_saved = None
         self._stdin_buf = b""
         self._stdin_since = 0.0
@@ -970,6 +972,10 @@ class Client(object):
         if self._prefix_pending:
             self._prefix_pending = False
             return self._prefix_unit(unit, rects)
+        if self._repeat_until:
+            if time.time() < self._repeat_until and ARROW_RE.match(unit):
+                return self._prefix_unit(unit, rects)
+            self._repeat_until = 0.0
         if unit == PREFIX:
             self._prefix_pending = True
             if self._ime_saved is None:
@@ -1969,6 +1975,8 @@ class Client(object):
         out += [gap % (row + 1) for row in range(height)]
         return b"".join(out)
 
+    REPEAT_TIME = 0.5
+
     def _prefix_unit(self, unit, rects):
         if unit == PREFIX:
             active = self._active()
@@ -1982,6 +1990,8 @@ class Client(object):
                          b"D": "left"}.get(final)
             if direction and self._focus_direction(direction, rects):
                 self._focus_dirty = True
+            if direction:
+                self._repeat_until = time.time() + self.REPEAT_TIME
             return None
         key = latin_key(unit.decode(errors="ignore"))
         if key == "d":
