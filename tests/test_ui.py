@@ -425,6 +425,34 @@ class WindowTabTests(unittest.TestCase):
         result = client._input(click, {})
         self.assertEqual((result.action, result.arg), ("switch", ("index", 2)))
 
+    def test_explorer_docks_beside_panes_and_shares_focus(self):
+        from crowcli.client import Client, PaneRuntime
+        sent = []
+
+        class Conn(object):
+            def send(self, kind, data):
+                sent.append(data)
+        client = Client(object())
+        client._winsize = lambda: (120, 24)
+        runtime = PaneRuntime({"id": "p", "name": "pane0", "cwd": "/tmp"},
+                              {"meta": {}})
+        runtime.conn = Conn()
+        client.runtimes, client.active_id = [runtime], "p"
+        client._toggle_explorer()
+        width = client._sidebar_span()[0]
+        self.assertEqual(client._area()[0], width + 1)  # panes after it + gap
+        self.assertTrue(client.explorer_focus)
+        client._input(b"j", {})
+        self.assertEqual(sent, [])  # explorer has the keys
+        rects = {"p": (width + 1, 0, 119 - width, 23)}
+        client._input(("\x1b[<0;%d;5M" % (width + 10)).encode(), rects)
+        self.assertTrue(client.explorer_open)  # still visible
+        self.assertFalse(client.explorer_focus)
+        client._input(b"j", rects)
+        self.assertEqual(sent, [b"j"])  # terminal gets the keys
+        client._input(b"\x1b[<0;5;5M", rects)  # click the explorer
+        self.assertTrue(client.explorer_focus)
+
     def test_hosts_button_toggles_the_sidebar(self):
         from crowcli.client import Client
         client = Client(object())
@@ -483,11 +511,14 @@ class PanelWidthTests(unittest.TestCase):
         client.explorer_entries = [("긴한글이름파일.txt", False,
                                     "/tmp/한글폴더/긴한글이름파일.txt"),
                                    ("폴더", True, "/tmp/한글폴더/폴더")]
-        area_w = client._area()[2]
-        width = min(40, area_w)
+        width = client._sidebar_span()[0]  # docked in the left column
         area_h = client._area()[3]
         chunk = client._explorer_chunk()
-        self.assertEqual(self._display_width(chunk), width * area_h)
+        self.assertEqual(self._display_width(chunk), (width + 1) * area_h)
+        client.explorer_path = "/tmp/" + "아주긴폴더이름" * 6
+        chunk = client._explorer_chunk()
+        self.assertEqual(self._display_width(chunk), (width + 1) * area_h)
+        self.assertIn("Files: …".encode(), chunk)  # label survives a cut
 
     def test_explorer_and_sidebar_never_show_together(self):
         from crowcli.client import Client
@@ -497,7 +528,8 @@ class PanelWidthTests(unittest.TestCase):
         self.assertEqual(client._area()[0], 28)
         client.explorer_open = True
         self.assertEqual(client._sidebar_chunk(), b"")
-        self.assertEqual(client._area()[0], 0)  # panes get full width
+        # the explorer takes the sidebar's column; panes sit beside it
+        self.assertEqual(client._area()[0], client._sidebar_span()[0] + 1)
         client.explorer_open = False
         self.assertEqual(client._area()[0], 28)
 

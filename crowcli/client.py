@@ -155,6 +155,7 @@ class Client(object):
         self._pending_host = None
         self._pending_local = False
         self.explorer_open = False
+        self.explorer_focus = False
         self.help_open = False
         self._help_opened_at = 0.0
         self._help_full = False
@@ -188,11 +189,14 @@ class Client(object):
 
     def _sidebar_span(self):
         """(content_width, divider_x, pane_x), all 0-based columns.
-        The file explorer and the sidebar never show together: while
-        the explorer is open the sidebar yields the whole width."""
-        if self.explorer_open or not Client.sidebar_open:
-            return 0, 0, 0
+        The file explorer and the sidebar share the left column: while
+        the explorer is open it takes the sidebar's place."""
         cols, _ = self._winsize()
+        if self.explorer_open:  # docked beside the panes, never over them
+            width = min(40, max(20, cols // 3))
+            return width, width, width + 1
+        if not Client.sidebar_open:
+            return 0, 0, 0
         content = 27 if cols >= 80 else max(16, cols // 3)
         return content, content, content + 1
 
@@ -699,8 +703,8 @@ class Client(object):
         if self.form is not None and self.form.get("cursor"):
             row, col = self.form["cursor"]
             chunks.append(("\x1b[%d;%dH\x1b[?25h" % (row, col)).encode())
-        elif self.explorer_open or self.reverse_open or self.help_open \
-                or self.form is not None:
+        elif (self.explorer_open and self.explorer_focus) or \
+                self.reverse_open or self.help_open or self.form is not None:
             chunks.append(b"\x1b[?25l")
         elif rect and screen.cursor_visible and \
                 active.view_offset == 0:
@@ -900,8 +904,9 @@ class Client(object):
         result = self._unit_inner(unit, rects)
         # A Korean IME would hold the command key in its composition
         # buffer, so prefix mode (and panels opened from it) runs in ABC.
-        if self._ime_saved and not (self._prefix_pending or self.reverse_open
-                                    or self.explorer_open):
+        if self._ime_saved and not (
+                self._prefix_pending or self.reverse_open
+                or (self.explorer_open and self.explorer_focus)):
             self._restore_ime()
         return result
 
@@ -931,7 +936,7 @@ class Client(object):
             return result
         if self.reverse_open:
             return self._reverse_key(unit)
-        if self.explorer_open:
+        if self.explorer_open and self.explorer_focus:
             return self._explorer_key(unit)
         active = self._active()
         if unit == b"\x16" and self._start_image_paste(active):
@@ -1017,6 +1022,12 @@ class Client(object):
                             "switch", ("index", action[1]))
             return
         pane_x = self._area()[0]
+        if self.explorer_open and gx <= pane_x:
+            if final == b"M" and not self.explorer_focus:
+                self.explorer_focus = True
+                self._focus_dirty = True
+            self._explorer_click(button, gx, gy, final)
+            return
         if gx <= pane_x:
             if final == b"M" and button not in (64, 65):
                 result = self._sidebar_click(gy)
@@ -1028,9 +1039,10 @@ class Client(object):
         if self.reverse_open:
             self._reverse_click(button, gx, gy, final)
             return
-        if self.explorer_open:
-            self._explorer_click(button, gx, gy, final)
-            return
+        if self.explorer_open and self.explorer_focus and final == b"M" \
+                and button not in (64, 65):
+            self.explorer_focus = False  # keys go to the clicked pane
+            self._focus_dirty = True
         for pane_id, (x, y, w, h) in rects.items():
             if not (x < gx <= x + w and y < gy <= y + h):
                 continue
@@ -1318,6 +1330,7 @@ class Client(object):
                 self.explorer_path = os.path.expanduser("~")
             self._explorer_load()
             self.explorer_open = True
+            self.explorer_focus = True
         self._focus_dirty = True
 
     def _explorer_load(self):
@@ -1391,19 +1404,14 @@ class Client(object):
         return None
 
     def _explorer_click(self, button, gx, gy, final):
-        _x, _y, area_w, area_h = self._area()
-        width = min(40, area_w)
+        area_h = self._area()[3]
         if button in (64, 65):
             self.explorer_sel = max(0, min(
                 len(self.explorer_entries) - 1,
                 self.explorer_sel + (3 if button == 65 else -3)))
             self._focus_dirty = True
             return
-        if final != b"M":
-            return
-        if gx - self._area()[0] > width or gy > area_h:
-            self.explorer_open = False
-            self._focus_dirty = True
+        if final != b"M" or gy > area_h:
             return
         row = gy - 2  # row 1 is the panel title
         if row < 0:
@@ -1738,26 +1746,28 @@ class Client(object):
         return ("".join(out) + "\x1b[0m").encode(errors="replace")
 
     def _explorer_chunk(self):
-        _x, _y, area_w, area_h = self._area()
-        width = min(40, area_w)
+        _x, _y, _w, area_h = self._area()
+        width = self._sidebar_span()[0]
         height = area_h
         inner = width - 2
         out = []
-        col = self._area()[0] + 1
+        col = 1
         title = " Files: " + (self.explorer_path or "")
-        if self._width(title) > inner:  # keep the tail, by display width
+        if self._width(title) > inner:  # keep the path's tail, by width
             kept, used = "", 0
-            for char in reversed(title):
+            for char in reversed(self.explorer_path or ""):
                 w = char_width(char)
-                if used + w > inner - 1:
+                if used + w > inner - 9:
                     break
                 kept = char + kept
                 used += w
-            title = "…" + kept
+            title = " Files: …" + kept
         bg = b"\x1b[0;48;5;231m"
         edge = bg + b"\x1b[38;5;250m"
+        title_style = b"\x1b[1;38;5;31m" if self.explorer_focus \
+            else b"\x1b[38;5;245m"
         out.append(("\x1b[1;%dH" % col).encode() + edge + "┌".encode()
-                   + bg + b"\x1b[1;38;5;31m" + title.encode() + edge
+                   + bg + title_style + title.encode() + edge
                    + ("─" * max(0, inner - self._width(title))
                       + "┐").encode() + b"\x1b[0m")
         visible = max(1, height - 2)
@@ -1773,14 +1783,17 @@ class Client(object):
                 selected = index == self.explorer_sel
             else:
                 label, selected = "", False
-            style = b"\x1b[0;1;48;5;195;38;5;16m" if selected else \
-                bg + b"\x1b[38;5;238m"
+            selected_style = b"\x1b[0;1;48;5;195;38;5;16m" \
+                if self.explorer_focus else b"\x1b[0;48;5;254;38;5;238m"
+            style = selected_style if selected else bg + b"\x1b[38;5;238m"
             out.append(("\x1b[%d;%dH" % (row + 2, col)).encode() + edge
                        + "│".encode() + style
                        + self._pad(label, inner).encode()
                        + edge + "│".encode() + b"\x1b[0m")
         out.append(("\x1b[%d;%dH" % (height, col)).encode() + edge
                    + ("└" + ("─" * inner) + "┘").encode() + b"\x1b[0m")
+        gap = ("\x1b[%%d;%dH " % (width + 1)).encode()  # pane-side margin
+        out += [gap % (row + 1) for row in range(height)]
         return b"".join(out)
 
     def _prefix_unit(self, unit, rects):
