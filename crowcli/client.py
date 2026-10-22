@@ -765,7 +765,7 @@ class Client(object):
         """Outer modes + real cursor position follow the active pane."""
         active = self._active()
         if active is None:
-            return b""
+            return b"\x1b[1;1H\x1b[?25l"
         chunks = []
         rect = rects.get(active.id)
         screen = active.screen
@@ -777,17 +777,30 @@ class Client(object):
         if self.form is not None and self.form.get("cursor"):
             row, col = self.form["cursor"]
             chunks.append(("\x1b[%d;%dH\x1b[?25h" % (row, col)).encode())
-        elif (self.explorer_open and self.explorer_focus) or \
-                self.reverse_open or self.help_open or self.form is not None:
-            chunks.append(b"\x1b[?25l")
-        elif rect and screen.cursor_visible and \
-                active.view_offset == 0:
-            chunks.append(("\x1b[%d;%dH\x1b[?25h"
-                           % (rect[1] + screen.cy + 1,
-                              rect[0] + screen.cx + 1)).encode())
+            return b"".join(chunks)
+        # Even hidden, the real cursor must sit somewhere sane: the IME
+        # draws its composition there, and Terminal.app crashes drawing
+        # it at the bar's last column (pending wrap) or mid-wide-char.
+        chunks.append(self._park_cursor(rect, screen))
+        if rect and screen.cursor_visible and active.view_offset == 0 \
+                and not ((self.explorer_open and self.explorer_focus)
+                         or self.reverse_open or self.help_open
+                         or self.form is not None):
+            chunks.append(b"\x1b[?25h")
         else:
             chunks.append(b"\x1b[?25l")
         return b"".join(chunks)
+
+    @staticmethod
+    def _park_cursor(rect, screen):
+        if not rect:
+            return b"\x1b[1;1H"
+        y = max(0, min(screen.cy, rect[3] - 1, screen.rows - 1))
+        x = max(0, min(screen.cx, rect[2] - 1, screen.cols - 1))
+        line = screen.grid[y]
+        while x > 0 and line[x][0] == "":  # right half of a wide char
+            x -= 1
+        return ("\x1b[%d;%dH" % (rect[1] + y + 1, rect[0] + x + 1)).encode()
 
     def _repaint_bar(self, out, rects):
         out.write(self._bar_chunk() + self._cursor_chunk(rects))
