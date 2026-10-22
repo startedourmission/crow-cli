@@ -1339,7 +1339,14 @@ class Client(object):
                  "label": "리버스 에이전트 실행 →"},
                 {"kind": "check", "label": "키·연결 확인" + suffix},
                 {"kind": "install", "label": "공개키 서버에 설치"},
+                {"kind": "info", "label": ""},
+                {"kind": "host-edit", "label": "호스트 수정…"},
+                {"kind": "host-delete", "label": "호스트 삭제…"},
             ]
+        if self.reverse_stage == "host-delete" and self._pending_host:
+            return [{"kind": "host-delete-yes",
+                     "label": "삭제 (열린 세션은 그대로)"},
+                    {"kind": "host-delete-no", "label": "취소"}]
         if not self._pending_host and not self._pending_local:
             return [{"kind": "none",
                      "label": "저장된 호스트가 없습니다"}]
@@ -1371,8 +1378,22 @@ class Client(object):
             result = self._key_activate(row)
             self._focus_dirty = True
             return result
-        if row["kind"] == "none":
+        if row["kind"] in ("none", "info"):
             pass
+        elif row["kind"] == "host-edit":
+            self._open_host_form(self._pending_host)
+        elif row["kind"] == "host-delete":
+            self.reverse_stage = "host-delete"
+            self.reverse_sel = 0
+        elif row["kind"] == "host-delete-no":
+            self.reverse_stage = "menu"
+            self.reverse_sel = 0
+        elif row["kind"] == "host-delete-yes":
+            if self.host_form and "delete" in self.host_form:
+                self._flash(self.host_form["delete"](self._pending_host))
+            self._pending_host = None
+            self.reverse_open = False
+            self._sidebar_at = 0.0
         elif row["kind"] == "ssh":
             self.reverse_open = False
             return AttachResult("ssh-connect", self._pending_host)
@@ -1419,6 +1440,9 @@ class Client(object):
         if key in ("q", "\x1b"):
             if self.reverse_stage in self.KEY_STAGES:
                 self._key_back()
+            elif self.reverse_stage == "host-delete":
+                self.reverse_stage = "menu"
+                self.reverse_sel = 0
             elif self.reverse_stage == "provider" and self._pending_host:
                 self.reverse_stage = "menu"  # back to the host menu
                 self.reverse_sel = 0
@@ -1479,7 +1503,8 @@ class Client(object):
         edge = bg + b"\x1b[38;5;250m"
         keys = self.reverse_stage in self.KEY_STAGES
         title = " SSH 키 " if keys else " 호스트 " \
-            if self.reverse_stage == "menu" else " 리버스 에이전트 "
+            if self.reverse_stage in ("menu", "host-delete") \
+            else " 리버스 에이전트 "
         out.append(("\x1b[1;%dH" % col).encode() + edge + "┌".encode()
                    + bg + b"\x1b[1;38;5;31m" + title.encode() + edge
                    + ("─" * max(0, inner - self._width(title))
@@ -1493,6 +1518,9 @@ class Client(object):
             subtitle = " %s 공개키를 설치할 호스트" % key_name
         elif self.reverse_stage == "key-delete":
             subtitle = " %s 삭제" % key_name
+        elif self.reverse_stage == "host-delete" and self._pending_host:
+            subtitle = " %s 호스트를 삭제할까요?" % \
+                self._pending_host.get("name", "?")
         elif self.reverse_stage == "menu" and self._pending_host:
             subtitle = " %s — %s" % (self._pending_host.get("name", "?"),
                                       self._pending_host.get("address", ""))
@@ -1754,11 +1782,24 @@ class Client(object):
     # -- host add form ----------------------------------------------------------
     FORM_FIELDS = ("address", "port", "key", "save", "cancel")
 
-    def _open_host_form(self):
+    def _open_host_form(self, host=None):
+        """Empty form adds a host; passing a saved host edits it."""
         keys = [("기본 키 자동 탐색", None)]
         if self.host_form:
             keys += list(self.host_form["keys"]())
-        self.form = {"address": "", "port": "", "keys": keys, "key": 0,
+        host = host or {}
+        key = 0
+        identity = host.get("identity")
+        if identity:
+            wanted = os.path.expanduser(identity)
+            key = next((i for i, (_label, path) in enumerate(keys)
+                        if path and os.path.expanduser(path) == wanted), None)
+            if key is None:
+                keys.append((os.path.basename(identity), identity))
+                key = len(keys) - 1
+        self.form = {"address": host.get("address", ""),
+                     "port": str(host["port"]) if host.get("port") else "",
+                     "keys": keys, "key": key, "edit": host.get("name"),
                      "focus": 0, "error": None, "opened": time.time(),
                      "cursor": None, "hits": []}
         self.explorer_open = False
@@ -1784,9 +1825,10 @@ class Client(object):
             form["focus"] = 0
             return None
         identity = form["keys"][form["key"]][1]
+        extra = {"original": form["edit"]} if form.get("edit") else {}
         try:
             record = self.host_form["save"](address, form["port"].strip(),
-                                            identity)
+                                            identity, **extra)
         except ValueError as exc:
             form["error"] = str(exc)
             return None
@@ -1887,11 +1929,12 @@ class Client(object):
                          + " " * (inner - 2 - label_w - field_w))
 
         address = form["address"].strip()
-        derived = address and self.host_form and \
+        derived = form.get("edit") or address and self.host_form and \
             self.host_form["derive"](address)
         key_label, key_path = form["keys"][form["key"]]
         plain("")
-        plain("  저장하면 왼쪽 탭에서 바로 접속 · 리버스 할 수 있어요", dim)
+        plain("  열린 세션은 그대로, 다음 접속부터 적용돼요" if form.get("edit")
+              else "  저장하면 왼쪽 탭에서 바로 접속 · 리버스 할 수 있어요", dim)
         plain("")
         field("SSH 주소", "address", form["address"] or "user@host 또는 host",
               not form["address"])
@@ -1943,7 +1986,8 @@ class Client(object):
         def put(row, text):
             out.append("\x1b[%d;%dH" % (top + row + 1, left + 1) + text)
 
-        put(0, box + "╭" + self._pad("─ 호스트 추가 ", inner, "─") + "╮")
+        title = "─ 호스트 수정 " if form.get("edit") else "─ 호스트 추가 "
+        put(0, box + "╭" + self._pad(title, inner, "─") + "╮")
         blank = body + " " * inner
         lines = [blank] * (height - 2)
         if t >= 1.0:

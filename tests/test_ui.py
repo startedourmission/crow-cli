@@ -89,6 +89,19 @@ class UiTests(unittest.TestCase):
         listing = self.cli("hosts").stdout
         self.assertIn("jinwoo@10.0.0.9", listing)
         self.assertIn("key=기본(자동)", listing)
+        self.cli("host", "edit", "10.0.0.9", "--address", "root@10.0.0.10",
+                 "--port", "2200", "--identity", "~/.ssh/other",
+                 "--name", "box")
+        listing = self.cli("hosts").stdout
+        self.assertIn("box: root@10.0.0.10 port=2200 key=~/.ssh/other",
+                      listing)
+        self.cli("host", "edit", "box", "--default-port", "--default-key")
+        self.assertIn("box: root@10.0.0.10 key=기본(자동)",
+                      self.cli("hosts").stdout)
+        self.assertNotEqual(self.cli("host", "edit", "nope", "--port", "1",
+                                     check=False).returncode, 0)
+        self.cli("host", "rm", "box")
+        self.assertIn("no saved hosts", self.cli("hosts").stdout)
 
     def test_mouse_click_focuses_pane_and_wheel_does_not_crash(self):
         self.cli("new", "-d", "-s", "demo", "-c", self.ws.name, "--",
@@ -257,14 +270,19 @@ class HostFormTests(unittest.TestCase):
     def make_client(self, saved):
         from crowcli.client import Client
 
-        def save(address, port, identity):
+        def save(address, port, identity, original=None):
             if port == "0":
                 raise ValueError("포트는 1~65535 사이 숫자여야 해요")
-            saved.append((address, port, identity))
-            return {"name": "box", "address": address}
+            saved.append((address, port, identity) +
+                         ((original,) if original else ()))
+            return {"name": original or "box", "address": address}
+
+        def delete(host):
+            saved.append(("deleted", host["name"]))
+            return "%s 삭제함" % host["name"]
         client = Client(object(), host_form={
             "keys": lambda: [("~/.ssh/id_ed25519", "/k/id_ed25519")],
-            "derive": lambda a: "box", "save": save})
+            "derive": lambda a: "box", "save": save, "delete": delete})
         client._winsize = lambda: (100, 30)
         client._toggle_reverse = lambda: setattr(
             client, "reverse_open", not client.reverse_open)
@@ -294,6 +312,60 @@ class HostFormTests(unittest.TestCase):
         self.assertIsNone(client.form)
         self.assertTrue(client.reverse_open)
         self.assertEqual(client.reverse_stage, "menu")
+
+    def pick(self, client, kind):
+        rows = client._reverse_rows()
+        client.reverse_sel = [r["kind"] for r in rows].index(kind)
+        return client._input(b"\r", {})
+
+    def test_edit_prefills_and_keeps_name(self):
+        from crowcli.vt import Screen
+        saved = []
+        client = self.make_client(saved)
+        host = {"name": "mac", "address": "me@10.0.0.5", "port": 2222,
+                "identity": "/k/id_ed25519"}
+        client._open_reverse_for_host(host)
+        self.pick(client, "host-edit")
+        self.assertEqual((client.form["address"], client.form["port"]),
+                         ("me@10.0.0.5", "2222"))
+        self.assertEqual(client.form["keys"][client.form["key"]][1],
+                         "/k/id_ed25519")
+        client.form["opened"] = 0
+        screen = Screen(100, 30)
+        screen.feed(client._form_chunk())
+        text = "\n".join("".join(c[0] for c in row) for row in screen.grid)
+        self.assertIn("호스트 수정", text)
+        self.assertIn("이름: mac", text)
+        client._input(b"\x7f", {})
+        client._input(b"6", {})
+        client._input(b"\r", {})
+        self.assertEqual(saved, [("me@10.0.0.6", "2222", "/k/id_ed25519",
+                                  "mac")])
+        self.assertEqual(client.reverse_stage, "menu")
+        self.assertEqual(client._pending_host["name"], "mac")
+
+    def test_edit_keeps_unlisted_key(self):
+        client = self.make_client([])
+        client._open_host_form({"name": "mac", "address": "a@b",
+                                "identity": "~/.ssh/custom"})
+        self.assertEqual(client.form["keys"][client.form["key"]],
+                         ("custom", "~/.ssh/custom"))
+
+    def test_delete_asks_then_removes(self):
+        saved = []
+        client = self.make_client(saved)
+        client._flash = lambda text: saved.append(("flash", text))
+        client._open_reverse_for_host({"name": "mac", "address": "a@b"})
+        self.pick(client, "host-delete")
+        self.assertEqual(client.reverse_stage, "host-delete")
+        self.pick(client, "host-delete-no")
+        self.assertEqual(client.reverse_stage, "menu")
+        self.assertEqual(saved, [])
+        self.pick(client, "host-delete")
+        self.pick(client, "host-delete-yes")
+        self.assertEqual(saved, [("deleted", "mac"), ("flash", "mac 삭제함")])
+        self.assertFalse(client.reverse_open)
+        self.assertIsNone(client._pending_host)
 
     def test_escape_cancels_and_empty_address_is_refused(self):
         saved = []

@@ -439,7 +439,8 @@ def run_attach(name):
                             windows_provider=window_tabs,
                             host_form={"keys": host_form_keys,
                                        "derive": derive_host_name,
-                                       "save": host_form_save},
+                                       "save": host_form_save,
+                                       "delete": host_form_delete},
                             image_target=image_target,
                             key_actions={"list": key_entries,
                                          "copy": copy_public_key,
@@ -1015,16 +1016,36 @@ def host_form_keys():
     return choices
 
 
-def host_form_save(address, port_text, identity):
-    """Save a host from the UI form; ValueError carries the message."""
+def host_form_save(address, port_text, identity, original=None):
+    """Save a host from the UI form; ValueError carries the message.
+    `original` is the name of the host being edited (kept as-is)."""
     port = None
     if port_text:
         if not port_text.isdigit() or not 0 < int(port_text) < 65536:
             raise ValueError("포트는 1~65535 사이 숫자여야 해요")
         port = int(port_text)
-    name = derive_host_name(address)
-    return with_registry(
-        lambda reg: save_host(reg, name, address, port, identity))
+    name = original or derive_host_name(address)
+
+    def save(reg):
+        if original and find_host(reg, original) is None:
+            raise ValueError("이미 삭제된 호스트예요: %s" % original)
+        return save_host(reg, name, address, port, identity)
+    return with_registry(save)
+
+
+def remove_host(name):
+    def remove(reg):
+        hosts = reg.data.get("hosts", [])
+        reg.data["hosts"] = [h for h in hosts if h["name"] != name]
+        return len(reg.data["hosts"]) != len(hosts)
+    return with_registry(remove)
+
+
+def host_form_delete(host):
+    name = host.get("name", "")
+    if not remove_host(name):
+        return "%s: 이미 없는 호스트예요" % name
+    return "%s 삭제함" % name
 
 
 def save_host(reg, name, address, port=None, identity=None):
@@ -1073,13 +1094,51 @@ def cmd_host_add(args):
 
 
 def cmd_host_rm(args):
-    def remove(reg):
-        hosts = reg.data.get("hosts", [])
-        reg.data["hosts"] = [h for h in hosts if h["name"] != args.name]
-        if len(reg.data["hosts"]) == len(hosts):
-            raise SystemExit("crow-cli: no saved host %r" % args.name)
-    with_registry(remove)
+    if not remove_host(args.name):
+        raise SystemExit("crow-cli: no saved host %r" % args.name)
     print("removed %s" % args.name)
+    return 0
+
+
+def cmd_host_edit(args):
+    if args.port is not None and not 0 < args.port < 65536:
+        raise SystemExit("crow-cli: 포트는 1~65535 사이 숫자여야 해요")
+    if args.rename:
+        registry_mod.validate_name(args.rename)
+
+    def edit(reg):
+        host = find_host(reg, args.name)
+        if host is None:
+            raise SystemExit("crow-cli: no saved host %r (crow hosts)"
+                             % args.name)
+        if args.rename and args.rename != host["name"] \
+                and find_host(reg, args.rename):
+            raise SystemExit("crow-cli: host %r already exists"
+                             % args.rename)
+        if args.address:
+            host["address"] = args.address
+        if args.port is not None:
+            host["port"] = args.port
+        if args.default_port:
+            host["port"] = None
+        if args.key:
+            key = find_key(reg, args.key)
+            if key is None:
+                raise SystemExit("crow-cli: no such key %r (crow keys)"
+                                 % args.key)
+            host["identity"] = key["path"]
+        elif args.identity:
+            host["identity"] = args.identity
+        elif args.default_key:
+            host["identity"] = None
+        if args.rename:
+            host["name"] = args.rename
+        return dict(host)
+    host = with_registry(edit)
+    print("%s: %s%s (키: %s)" % (
+        host["name"], host["address"],
+        " port=%s" % host["port"] if host.get("port") else "",
+        host.get("identity") or "기본 키 자동 탐색 ~/.ssh/id_*"))
     return 0
 
 
@@ -1805,9 +1864,21 @@ def build_parser():
     hp.add_argument("--identity", help="ssh identity file")
     hp.add_argument("--key", help="키 이름 (crow keys에서 선택)")
     hp.set_defaults(fn=cmd_host_add)
-    hp = host_sub.add_parser("rm")
+    hp = host_sub.add_parser("rm", help="저장된 호스트 삭제")
     hp.add_argument("name")
     hp.set_defaults(fn=cmd_host_rm)
+    hp = host_sub.add_parser("edit", help="저장된 호스트 수정")
+    hp.add_argument("name")
+    hp.add_argument("--address", help="새 주소 user@host")
+    hp.add_argument("--port", type=int)
+    hp.add_argument("--default-port", action="store_true",
+                    help="포트 지정 해제 (22)")
+    hp.add_argument("--key", help="키 이름 (crow keys에서 선택)")
+    hp.add_argument("--identity", help="ssh identity file")
+    hp.add_argument("--default-key", action="store_true",
+                    help="키 지정 해제 (기본 키 자동 탐색)")
+    hp.add_argument("--name", dest="rename", help="새 이름")
+    hp.set_defaults(fn=cmd_host_edit)
     hp = host_sub.add_parser("check", help="연결 + 키 인증 확인")
     hp.add_argument("name")
     hp.set_defaults(fn=cmd_host_check)

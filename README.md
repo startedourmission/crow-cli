@@ -104,6 +104,8 @@ macOS에서 한글 입력 상태로 `C-b`를 누르면 명령 키를 기다리�
 됩니다. 호스트 추가를 고르면 화면 위에 입력 팝업이 떠서 주소·포트·키(관리 키와
 `~/.ssh` 키 중 `←→`로 선택)를 받고, 저장하면 그 호스트 메뉴가 바로 열립니다.
 이름은 주소에서 자동으로 정해집니다 (IP면 IP 그대로).
+호스트 메뉴의 `호스트 수정…`은 같은 팝업을 현재 값으로 채워 열고(이름은 유지),
+`호스트 삭제…`는 한 번 더 확인한 뒤 지웁니다. 이미 열린 세션은 영향이 없습니다.
 이미 있는 리버스 세션은 패널의 "세션 열기"에서 바로 들어갑니다.
 세션 이름은 `reverse-<에이전트>`(`reverse-claude`)이고, 같은 에이전트를
 다른 호스트·폴더로 또 띄우면 `reverse-claude-2`처럼 번호가 붙습니다.
@@ -131,7 +133,9 @@ SSH 세션 pane에서 `Ctrl-V`를 누르면 Mac 클립보드의 이미지를 PNG
 ```sh
 ./crow host add mac --address user@192.168.0.10 --port 22 --identity ~/.ssh/id_ed25519
 ./crow hosts          # 저장된 호스트 목록
-./crow host rm mac
+./crow host edit mac --address user@192.168.0.11 --port 2222 --key work --name mac2
+./crow host edit mac2 --default-port --default-key   # 포트·키 지정 해제
+./crow host rm mac2
 ./crow reverse-agent --host mac --provider claude --dir ~/project   # CLI로 바로 시작
 ```
 
