@@ -160,8 +160,9 @@ class HostMenuTests(unittest.TestCase):
         client._reverse_key(b"q")
         self.assertEqual(client.reverse_stage, "keys")
         labels = [r["label"] for r in client._reverse_rows()]
-        self.assertTrue(labels[-1].startswith("+ 새 키"))
-        client.reverse_sel = len(labels) - 1
+        self.assertTrue(labels[0].startswith("+ 새 키 만들기"))
+        self.assertIn("관리 키", labels)
+        client.reverse_sel = 0
         self.assertEqual(client._reverse_activate().action, "key-generate")
         client._open_keys(key)
         client.reverse_sel = 3

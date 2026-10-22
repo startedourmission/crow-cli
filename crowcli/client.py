@@ -538,7 +538,9 @@ class Client(object):
         if len(keys) > 5:
             lines.append(("   … 외 %d개" % (len(keys) - 5),
                           "38;5;245;" + bg, ("keys", None)))
-        lines.append((" + 키 관리…", "38;5;31;" + bg, ("keys", None)))
+        lines.append((" + 새 키 만들기…", "38;5;31;" + bg,
+                      ("key-generate", None)))
+        lines.append((" ⋯ 키 목록·관리", "38;5;31;" + bg, ("keys", None)))
         out = []
         self._sidebar_rows = []
         for row in range(area_h):
@@ -563,6 +565,8 @@ class Client(object):
                     self._open_host_form()
                 elif kind in ("key", "keys"):
                     self._open_keys(arg)
+                elif kind == "key-generate":
+                    return AttachResult("key-generate", None)
         return None
 
     def _open_keys(self, key=None):
@@ -1167,16 +1171,23 @@ class Client(object):
     def _key_rows(self):
         key = self._pending_key or {}
         if self.reverse_stage == "keys":
-            rows = []
-            for item in self.key_list:
-                fingerprint = item.get("sha256", "")
-                rows.append({"kind": "key-open", "key": item, "label":
-                             "◆ %s · %s · %s" % (
-                                 item["name"], item.get("type", "?"),
-                                 fingerprint[7:15] + "…"
-                                 if fingerprint else item["origin"])})
-            rows.append({"kind": "key-generate",
-                         "label": "+ 새 키 생성 (Ed25519)"})
+            rows = [{"kind": "key-generate",
+                     "label": "+ 새 키 만들기 (Ed25519)"}]
+            for managed, heading in ((True, "관리 키"),
+                                     (False, "이 컴퓨터 · ~/.ssh")):
+                group = [k for k in self.key_list
+                         if bool(k.get("managed")) == managed]
+                if not group:
+                    continue
+                rows.append({"kind": "info", "label": ""})
+                rows.append({"kind": "info", "label": heading})
+                for item in group:
+                    fingerprint = item.get("sha256", "")
+                    rows.append({"kind": "key-open", "key": item, "label":
+                                 "◆ %s · %s %s" % (
+                                     item["name"], item.get("type", "?"),
+                                     fingerprint[7:15] + "…"
+                                     if fingerprint else "")})
             return rows
         if self.reverse_stage == "key":
             rows = [{"kind": "key-copy", "label": "공개키 클립보드에 복사"},
