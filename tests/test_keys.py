@@ -36,6 +36,37 @@ class KeyTests(unittest.TestCase):
                 args, result.stdout, result.stderr))
         return result
 
+    def test_host_alias_save_rename_and_clash(self):
+        from unittest import mock
+        from crowcli import cli, registry
+        with mock.patch.dict(os.environ, CROWCLI_HOME=self.home.name):
+            cli.host_form_save("root@10.0.0.5", "", None, name="회사서버")
+            cli.host_form_save("me@10.0.0.6", "22", None)
+            hosts = registry.load_registry().data["hosts"]
+            self.assertEqual([h["name"] for h in hosts],
+                             ["회사서버", "10.0.0.6"])
+            with self.assertRaisesRegex(ValueError, "이미 있는 별칭"):
+                cli.host_form_save("x@y", "", None, name="10.0.0.6")
+            with self.assertRaisesRegex(ValueError, "이미 있는 별칭"):
+                cli.host_form_save("root@10.0.0.5", "", None,
+                                   original="회사서버", name="10.0.0.6")
+            with self.assertRaisesRegex(ValueError, "별칭은"):
+                cli.host_form_save("x@y", "", None, name="a/b")
+            cli.host_form_save("root@10.0.0.7", "", None,
+                               original="회사서버", name="집")
+            hosts = registry.load_registry().data["hosts"]
+            self.assertEqual([(h["name"], h["address"]) for h in hosts],
+                             [("집", "root@10.0.0.7"),
+                              ("10.0.0.6", "me@10.0.0.6")])
+            # Re-adding the same address under its derived name updates it.
+            cli.host_form_save("me@10.0.0.6", "2222", None)
+            self.assertEqual(len(registry.load_registry().data["hosts"]), 2)
+        self.assertEqual(cli.derive_host_name("집"), "집")
+        self.addCleanup(subprocess.run, [CROW, "kill-session", "-t", "ssh-집"],
+                        env=self.env, capture_output=True, timeout=30)
+        self.assertIn("ssh-집", self.cli("ssh", "집", "-d").stdout +
+                      self.cli("ls").stdout)
+
     def test_key_lifecycle_and_host_binding(self):
         self.cli("key", "add", "work", "--passphrase", "")
         listing = self.cli("keys").stdout

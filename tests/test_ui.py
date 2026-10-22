@@ -270,12 +270,13 @@ class HostFormTests(unittest.TestCase):
     def make_client(self, saved):
         from crowcli.client import Client
 
-        def save(address, port, identity, original=None):
+        def save(address, port, identity, original=None, name=None):
             if port == "0":
                 raise ValueError("포트는 1~65535 사이 숫자여야 해요")
             saved.append((address, port, identity) +
-                         ((original,) if original else ()))
-            return {"name": original or "box", "address": address}
+                         ((original,) if original else ()) +
+                         ((name,) if name else ()))
+            return {"name": name or original or "box", "address": address}
 
         def delete(host):
             saved.append(("deleted", host["name"]))
@@ -295,7 +296,8 @@ class HostFormTests(unittest.TestCase):
         client._open_host_form()
         client.form["opened"] = 0
         for unit in [b"r", b"o", b"o", b"t", b"@", b"b", b"x", b"\x7f",
-                     b"o", b"x", b"\t", b"a", b"0", b"\t", b"\x1b[C"]:
+                     b"o", b"x", b"\t", b"\t", b"a", b"0", b"\t",
+                     b"\x1b[C"]:
             self.assertIsNone(client._input(unit, {}))
         screen = Screen(100, 30)
         screen.feed(client._form_chunk())
@@ -335,14 +337,32 @@ class HostFormTests(unittest.TestCase):
         screen.feed(client._form_chunk())
         text = "\n".join("".join(c[0] for c in row) for row in screen.grid)
         self.assertIn("호스트 수정", text)
-        self.assertIn("이름: mac", text)
+        self.assertIn("mac", text)
+        self.assertEqual(client.form["name"], "mac")
         client._input(b"\x7f", {})
         client._input(b"6", {})
         client._input(b"\r", {})
         self.assertEqual(saved, [("me@10.0.0.6", "2222", "/k/id_ed25519",
-                                  "mac")])
+                                  "mac", "mac")])
         self.assertEqual(client.reverse_stage, "menu")
         self.assertEqual(client._pending_host["name"], "mac")
+
+    def test_alias_field(self):
+        from crowcli.vt import Screen
+        saved = []
+        client = self.make_client(saved)
+        client._open_host_form()
+        client.form["opened"] = 0
+        client._input(b"root@10.0.0.5\t", {})
+        screen = Screen(100, 30)
+        screen.feed(client._form_chunk())
+        text = "\n".join("".join(c[0] for c in row) for row in screen.grid)
+        self.assertIn("별칭", text)
+        self.assertIn("box (주소에서 자동)", text)
+        client._input("회사 서버".encode(), {})  # spaces are dropped
+        client._input(b"\r", {})
+        self.assertEqual(saved, [("root@10.0.0.5", "", None, "회사서버")])
+        self.assertEqual(client._pending_host["name"], "회사서버")
 
     def test_caret_moves_and_edits_mid_text(self):
         from crowcli.vt import Screen

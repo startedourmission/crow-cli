@@ -21,7 +21,7 @@ import re
 import time
 import uuid
 
-NAME_RE = re.compile(r"^[A-Za-z0-9_.\-]+$")
+NAME_RE = re.compile(r"^[\w.\-]+$")  # \w includes Hangul etc.
 
 
 def home():

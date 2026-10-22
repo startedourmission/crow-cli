@@ -998,7 +998,7 @@ def derive_host_name(address):
     host = address.rpartition("@")[2] or address
     if re.match(r"^[0-9.]+$", host):
         return host  # an IP's first octet says nothing
-    name = re.sub(r"[^A-Za-z0-9_.\-]+", "-", host.split(".")[0]).strip("-")
+    name = re.sub(r"[^\w.\-]+", "-", host.split(".")[0]).strip("-")
     return name or "host"
 
 
@@ -1016,19 +1016,31 @@ def host_form_keys():
     return choices
 
 
-def host_form_save(address, port_text, identity, original=None):
+def host_form_save(address, port_text, identity, original=None, name=None):
     """Save a host from the UI form; ValueError carries the message.
-    `original` is the name of the host being edited (kept as-is)."""
+    `original` is the name of the host being edited; `name` is the alias
+    typed in the form (empty = keep the old one / derive from address)."""
     port = None
     if port_text:
         if not port_text.isdigit() or not 0 < int(port_text) < 65536:
             raise ValueError("포트는 1~65535 사이 숫자여야 해요")
         port = int(port_text)
-    name = original or derive_host_name(address)
+    name = name or original or derive_host_name(address)
+    try:
+        registry_mod.validate_name(name)
+    except ValueError:
+        raise ValueError("별칭은 글자·숫자·_ . - 만 (공백 없이 64자 이내)")
 
     def save(reg):
-        if original and find_host(reg, original) is None:
+        old = find_host(reg, original) if original else None
+        if original and old is None:
             raise ValueError("이미 삭제된 호스트예요: %s" % original)
+        clash = find_host(reg, name)
+        if clash is not None and clash is not old and \
+                (original or clash["address"] != address):
+            raise ValueError("이미 있는 별칭이에요: %s" % name)
+        if old is not None:
+            old["name"] = name  # rename in place, keeping its position
         return save_host(reg, name, address, port, identity)
     return with_registry(save)
 

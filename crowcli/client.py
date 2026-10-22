@@ -1782,7 +1782,8 @@ class Client(object):
         return ("".join(out) + "\x1b[0m").encode(errors="replace")
 
     # -- host add form ----------------------------------------------------------
-    FORM_FIELDS = ("address", "port", "key", "save", "cancel")
+    FORM_FIELDS = ("address", "name", "port", "key", "save", "cancel")
+    FORM_TEXT = ("address", "name", "port")
 
     def _open_host_form(self, host=None):
         """Empty form adds a host; passing a saved host edits it."""
@@ -1801,8 +1802,10 @@ class Client(object):
                 key = len(keys) - 1
         address = host.get("address", "")
         port = str(host["port"]) if host.get("port") else ""
-        self.form = {"address": address, "port": port,
-                     "caret": {"address": len(address), "port": len(port)},
+        name = host.get("name", "")
+        self.form = {"address": address, "port": port, "name": name,
+                     "caret": {"address": len(address), "port": len(port),
+                               "name": len(name)},
                      "view": {}, "keys": keys, "key": key,
                      "edit": host.get("name"),
                      "focus": 0, "error": None, "opened": time.time(),
@@ -1831,6 +1834,8 @@ class Client(object):
             return None
         identity = form["keys"][form["key"]][1]
         extra = {"original": form["edit"]} if form.get("edit") else {}
+        if form["name"].strip():
+            extra["name"] = form["name"].strip()
         try:
             record = self.host_form["save"](address, form["port"].strip(),
                                             identity, **extra)
@@ -1887,12 +1892,13 @@ class Client(object):
             if field == "key":
                 form["key"] = (form["key"] + step) % len(form["keys"])
             elif field in ("save", "cancel"):
-                form["focus"] = 3 if field == "cancel" else 4
+                form["focus"] = self.FORM_FIELDS.index(
+                    "save" if field == "cancel" else "cancel")
             else:
                 caret[field] = max(0, min(len(form[field]),
                                           caret[field] + step))
             return None
-        if field not in ("address", "port"):
+        if field not in self.FORM_TEXT:
             return None
         value, at = form[field], min(caret[field], len(form[field]))
         if unit in (b"\x1b[H", b"\x1bOH", b"\x1b[1~", b"\x01"):
@@ -1920,6 +1926,8 @@ class Client(object):
         text = unit.decode(errors="ignore")
         if field == "port":
             text = "".join(c for c in text if c.isdigit())
+        elif field == "name":
+            text = "".join(c for c in text if not c.isspace())
         elif text.isspace():
             text = ""
         if text and text.isprintable():
@@ -1984,18 +1992,21 @@ class Client(object):
         derived = form.get("edit") or address and self.host_form and \
             self.host_form["derive"](address)
         key_label, key_path = form["keys"][form["key"]]
+        name_hint = "%s (주소에서 자동)" % derived if derived else \
+            "비우면 주소에서 자동"
         plain("")
         plain("  열린 세션은 그대로, 다음 접속부터 적용돼요" if form.get("edit")
               else "  저장하면 왼쪽 탭에서 바로 접속 · 리버스 할 수 있어요", dim)
         plain("")
         field("SSH 주소", "address", form["address"] or "user@host 또는 host",
               not form["address"])
+        field("별칭", "name", form["name"] or name_hint, not form["name"])
         field("포트", "port", form["port"] or "22", not form["port"])
         field("키", "key", "‹ %s ›" % self._pad(key_label, field_w - 6).rstrip(),
               False)
         plain("")
-        plain("  이름: %s" % (derived or "주소에서 자동으로 정해져요")
-              + ("   키 파일: %s" % key_path if key_path else ""), dim)
+        plain("  키 파일: %s" % key_path if key_path else
+              "  키 파일: ~/.ssh/id_* 중 ssh가 고름", dim)
         if form["error"]:
             plain("  " + form["error"], "\x1b[0;48;5;235;38;5;203m")
         else:
@@ -2018,7 +2029,7 @@ class Client(object):
         form = self.form
         cols, rows = self._winsize()
         full_w = min(60, cols - 2)
-        full_h = 13
+        full_h = 14
         elapsed = time.time() - form["opened"]
         t = min(1.0, max(0.0, elapsed / self.HELP_ANIM))
         grow = 1 - (1 - t) ** 3
