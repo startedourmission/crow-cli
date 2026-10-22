@@ -64,6 +64,17 @@ class KeyTests(unittest.TestCase):
         self.cli("key", "rm", "copy", "--force")
         self.assertTrue(src.exists())  # import unregisters only
 
+    def test_key_rename_and_host_usage(self):
+        self.cli("key", "add", "work", "--passphrase", "")
+        self.cli("key", "rename", "work", "home")
+        self.cli("host", "add", "box", "--address", "root@127.0.0.1",
+                 "--key", "home")
+        listing = self.cli("keys").stdout
+        self.assertIn("home:", listing)
+        self.assertIn("호스트: box", listing)
+        clash = self.cli("key", "rename", "nope", "x", check=False)
+        self.assertNotEqual(clash.returncode, 0)
+
     def test_host_check_reports_refused(self):
         self.cli("host", "add", "bad", "--address", "root@127.0.0.1", "--port", "1")
         result = self.cli("host", "check", "bad", check=False)
@@ -103,6 +114,62 @@ class HostMenuTests(unittest.TestCase):
         client._reverse_key(b"q")
         self.assertEqual(client.reverse_stage, "menu")
         self.assertTrue(client.reverse_open)
+
+    def test_key_panel_flow(self):
+        import sys
+        sys.path.insert(0, str(REPO))
+        from crowcli.client import Client
+        from crowcli.vt import Screen
+        key = {"name": "work", "path": "/k/crow_work", "type": "ED25519",
+               "sha256": "SHA256:abcdefghijklmnop", "managed": True,
+               "origin": "관리됨", "hosts": []}
+        host = {"name": "mac", "address": "u@192.0.2.1"}
+        calls = []
+        client = Client(object(), sidebar_data_provider=lambda: {
+            "sessions": [], "hosts": [host], "keys": [key]},
+            key_actions={
+                "list": lambda: [key],
+                "copy": lambda k: calls.append(("copy", k["name"])) or "ok",
+                "delete": lambda k, f: calls.append(("delete", f)) or "gone"})
+        client._winsize = lambda: (100, 30)
+        client._refresh_sidebar()
+        client._sidebar_chunk()
+        row = next(r for r, (kind, _) in client._sidebar_rows
+                   if kind == "key")
+        client._sidebar_click(row + 1)
+        self.assertEqual(client.reverse_stage, "key")
+        screen = Screen(100, 30)
+        screen.feed(client._reverse_chunk())
+        text = "\n".join("".join(c[0] for c in r) for r in screen.grid)
+        self.assertIn("SSH 키", text)
+        self.assertIn("SHA256:abcdefghijklmnop", text)
+        client._reverse_activate()  # copy
+        self.assertEqual(calls, [("copy", "work")])
+        client.reverse_sel = 1  # install -> host picker -> result
+        client._reverse_activate()
+        self.assertEqual(client.reverse_stage, "key-host")
+        result = client._reverse_activate()
+        self.assertEqual(result.action, "key-install")
+        self.assertEqual(result.arg, (key, host))
+        client._open_keys(key)
+        client.reverse_sel = 3  # 삭제… -> confirm -> files
+        client._reverse_activate()
+        self.assertEqual(client.reverse_stage, "key-delete")
+        client._reverse_key(b"q")
+        self.assertEqual(client.reverse_stage, "key")
+        client._reverse_key(b"q")
+        self.assertEqual(client.reverse_stage, "keys")
+        labels = [r["label"] for r in client._reverse_rows()]
+        self.assertTrue(labels[-1].startswith("+ 새 키"))
+        client.reverse_sel = len(labels) - 1
+        self.assertEqual(client._reverse_activate().action, "key-generate")
+        client._open_keys(key)
+        client.reverse_sel = 3
+        client._reverse_activate()
+        client.reverse_sel = 1
+        client._reverse_activate()
+        self.assertEqual(calls[-1], ("delete", True))
+        self.assertEqual(client.reverse_stage, "keys")
 
 
 if __name__ == "__main__":

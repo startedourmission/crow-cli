@@ -121,8 +121,14 @@ class Client(object):
     def __init__(self, hooks, status_provider=None,
                  explorer_root_provider=None, reverse_data_provider=None,
                  sidebar_data_provider=None, notice_provider=None,
-                 windows_provider=None, host_form=None, image_target=None):
+                 windows_provider=None, host_form=None, image_target=None,
+                 key_actions=None):
         self.hooks = hooks
+        # {"list": () -> [key dict], "copy": key -> message,
+        #  "delete": (key, delete_files) -> message}
+        self.key_actions = key_actions or {}
+        self.key_list = []
+        self._pending_key = None
         # (pane meta, window meta) -> uploader(png bytes) -> path, or None
         # to pass Ctrl-V through (local panes paste images themselves).
         self.image_target = image_target
@@ -524,6 +530,15 @@ class Client(object):
                           "38;5;245;" + bg, None))
         lines.append((" + 호스트 추가…", "38;5;31;" + bg,
                       ("add-host", None)))
+        lines.append(("", plain, None))
+        lines.append((" SSH 키", heading, None))
+        keys = data.get("keys", [])
+        for key in keys[:5]:
+            lines.append((" ◆ " + key["name"], plain, ("key", key)))
+        if len(keys) > 5:
+            lines.append(("   … 외 %d개" % (len(keys) - 5),
+                          "38;5;245;" + bg, ("keys", None)))
+        lines.append((" + 키 관리…", "38;5;31;" + bg, ("keys", None)))
         out = []
         self._sidebar_rows = []
         for row in range(area_h):
@@ -546,7 +561,34 @@ class Client(object):
                     self._open_reverse_for_host(arg)
                 elif kind == "add-host":
                     self._open_host_form()
+                elif kind in ("key", "keys"):
+                    self._open_keys(arg)
         return None
+
+    def _open_keys(self, key=None):
+        """Key manager in the right panel: list → one key's actions."""
+        self.explorer_open = False
+        self.help_open = False
+        self._load_keys()
+        self._pending_key = None
+        self.reverse_stage = "keys"
+        if key:
+            found = next((k for k in self.key_list
+                          if k["path"] == key.get("path")), None)
+            if found:
+                self._pending_key = found
+                self.reverse_stage = "key"
+        self.reverse_sel = 0
+        self.reverse_scroll = 0
+        self.reverse_open = True
+        self._focus_dirty = True
+
+    def _load_keys(self):
+        try:
+            self.key_list = self.key_actions["list"]() \
+                if "list" in self.key_actions else []
+        except Exception:
+            self.key_list = []
 
     def _open_reverse_for_host(self, host):
         self._toggle_reverse()  # opens (loads fresh panel data)
@@ -1120,7 +1162,105 @@ class Client(object):
         self._pending_host = host
         self.reverse_sel = 0
 
+    KEY_STAGES = ("keys", "key", "key-host", "key-delete")
+
+    def _key_rows(self):
+        key = self._pending_key or {}
+        if self.reverse_stage == "keys":
+            rows = []
+            for item in self.key_list:
+                fingerprint = item.get("sha256", "")
+                rows.append({"kind": "key-open", "key": item, "label":
+                             "◆ %s · %s · %s" % (
+                                 item["name"], item.get("type", "?"),
+                                 fingerprint[7:15] + "…"
+                                 if fingerprint else item["origin"])})
+            rows.append({"kind": "key-generate",
+                         "label": "+ 새 키 생성 (Ed25519)"})
+            return rows
+        if self.reverse_stage == "key":
+            rows = [{"kind": "key-copy", "label": "공개키 클립보드에 복사"},
+                    {"kind": "key-install", "label": "서버에 공개키 설치 →"}]
+            if key.get("managed"):
+                rows += [{"kind": "key-rename", "label": "이름 변경…"},
+                         {"kind": "key-remove", "label": "삭제…"}]
+            rows += [{"kind": "info", "label": ""},
+                     {"kind": "info", "label": "종류  %s · %s" % (
+                         key.get("type", "?"), key.get("origin", ""))},
+                     {"kind": "info", "label": "지문  " +
+                      key.get("sha256", "?")},
+                     {"kind": "info", "label": "경로  " + key.get(
+                         "path", "").replace(os.path.expanduser("~"), "~", 1)},
+                     {"kind": "info", "label": "사용  " + (
+                         ", ".join(key.get("hosts") or []) or "없음")}]
+            return rows
+        if self.reverse_stage == "key-host":
+            hosts = self.reverse_data.get("hosts") or \
+                self._sidebar_data.get("hosts", [])
+            if not hosts:
+                return [{"kind": "info",
+                         "label": "저장된 호스트가 없습니다"}]
+            return [{"kind": "key-host-pick", "host": host,
+                     "label": "%s — %s" % (host.get("name", "?"),
+                                           host.get("address", ""))}
+                    for host in hosts]
+        rows = [{"kind": "key-unregister",
+                 "label": "등록만 해제 (파일은 그대로)"}]
+        if not key.get("imported"):
+            rows.append({"kind": "key-delete-files",
+                         "label": "개인키·공개키 파일까지 삭제"})
+        rows.append({"kind": "key-back", "label": "취소"})
+        return rows
+
+    def _key_activate(self, row):
+        kind, key = row["kind"], self._pending_key
+        if kind == "key-open":
+            self._pending_key = row["key"]
+            self.reverse_stage = "key"
+        elif kind == "key-generate":
+            self.reverse_open = False
+            return AttachResult("key-generate", None)
+        elif kind == "key-copy" and "copy" in self.key_actions:
+            self._flash(self.key_actions["copy"](key))
+        elif kind == "key-install":
+            self.reverse_stage = "key-host"
+        elif kind == "key-host-pick":
+            self.reverse_open = False
+            return AttachResult("key-install", (key, row["host"]))
+        elif kind == "key-rename":
+            self.reverse_open = False
+            return AttachResult("key-rename", key)
+        elif kind == "key-remove":
+            self.reverse_stage = "key-delete"
+        elif kind in ("key-unregister", "key-delete-files") \
+                and "delete" in self.key_actions:
+            self._flash(self.key_actions["delete"](
+                key, kind == "key-delete-files"))
+            self._load_keys()
+            self._pending_key = None
+            self.reverse_stage = "keys"
+        elif kind == "key-back":
+            self.reverse_stage = "key"
+        else:
+            return None
+        self.reverse_sel = 0
+        self.reverse_scroll = 0
+        return None
+
+    def _key_back(self):
+        if self.reverse_stage in ("key-host", "key-delete"):
+            self.reverse_stage = "key"
+        elif self.reverse_stage == "key":
+            self.reverse_stage = "keys"
+            self._pending_key = None
+        else:
+            self.reverse_open = False
+        self.reverse_sel = 0
+        self.reverse_scroll = 0
+
     def _reverse_rows(self):
+        if self.reverse_stage in self.KEY_STAGES:
+            return self._key_rows()
         if self.reverse_stage == "menu" and self._pending_host:
             host = self._pending_host
             state = self._host_status.get(
@@ -1160,6 +1300,10 @@ class Client(object):
         if not rows or self.reverse_sel >= len(rows):
             return None
         row = rows[self.reverse_sel]
+        if self.reverse_stage in self.KEY_STAGES:
+            result = self._key_activate(row)
+            self._focus_dirty = True
+            return result
         if row["kind"] == "none":
             pass
         elif row["kind"] == "ssh":
@@ -1206,13 +1350,16 @@ class Client(object):
             return None
         key = latin_key(unit.decode(errors="ignore"))
         if key in ("q", "\x1b"):
-            if self.reverse_stage == "provider" and self._pending_host:
+            if self.reverse_stage in self.KEY_STAGES:
+                self._key_back()
+            elif self.reverse_stage == "provider" and self._pending_host:
                 self.reverse_stage = "menu"  # back to the host menu
                 self.reverse_sel = 0
             else:
                 self.reverse_open = False
         elif key == "\t":
-            self._cycle_target()
+            if self.reverse_stage not in self.KEY_STAGES:
+                self._cycle_target()
         elif key in ("\r", "\n"):
             return self._reverse_activate()
         elif key == "j":
@@ -1263,13 +1410,23 @@ class Client(object):
         col = self._area()[0] + 1
         bg = b"\x1b[0;48;5;231m"
         edge = bg + b"\x1b[38;5;250m"
-        title = " 호스트 " if self.reverse_stage == "menu" \
-            else " 리버스 에이전트 "
+        keys = self.reverse_stage in self.KEY_STAGES
+        title = " SSH 키 " if keys else " 호스트 " \
+            if self.reverse_stage == "menu" else " 리버스 에이전트 "
         out.append(("\x1b[1;%dH" % col).encode() + edge + "┌".encode()
                    + bg + b"\x1b[1;38;5;31m" + title.encode() + edge
                    + ("─" * max(0, inner - self._width(title))
                       + "┐").encode() + b"\x1b[0m")
-        if self.reverse_stage == "menu" and self._pending_host:
+        key_name = (self._pending_key or {}).get("name", "")
+        if self.reverse_stage == "keys":
+            subtitle = " 관리 키 + ~/.ssh 자동 발견"
+        elif self.reverse_stage == "key":
+            subtitle = " " + key_name
+        elif self.reverse_stage == "key-host":
+            subtitle = " %s 공개키를 설치할 호스트" % key_name
+        elif self.reverse_stage == "key-delete":
+            subtitle = " %s 삭제" % key_name
+        elif self.reverse_stage == "menu" and self._pending_host:
             subtitle = " %s — %s" % (self._pending_host.get("name", "?"),
                                       self._pending_host.get("address", ""))
         elif not self._pending_host and not self._pending_local:
@@ -1295,14 +1452,17 @@ class Client(object):
                 selected = index == self.reverse_sel
             else:
                 label, selected = "", False
+            info = index < len(rows) and rows[index]["kind"] == "info"
             style = b"\x1b[0;1;48;5;195;38;5;16m" if selected else \
-                bg + b"\x1b[38;5;238m"
+                bg + (b"\x1b[38;5;245m" if info else b"\x1b[38;5;238m")
             prefix = "▸" if selected else " "
             out.append(("\x1b[%d;%dH" % (row + 3, col)).encode() + edge
                        + "│".encode() + style
                        + self._pad(prefix + label, inner).encode()
                        + edge + "│".encode() + b"\x1b[0m")
-        hint = " Enter 시작 · Tab 대상 변경 · q 닫기 "
+        hint = " Enter 열기 · q 닫기 " if self.reverse_stage == "keys" \
+            else " Enter 선택 · q 뒤로 " if keys \
+            else " Enter 시작 · Tab 대상 변경 · q 닫기 "
         out.append(("\x1b[%d;%dH" % (area_h, col)).encode() + edge
                    + "└".encode() + bg + b"\x1b[38;5;242m" + hint.encode()
                    + edge + ("─" * max(0, inner - self._width(hint))
@@ -1460,6 +1620,8 @@ class Client(object):
         rows.append(("  왼쪽 탭에서 세션 · 호스트 클릭으로 바로 이동",
                      "38;5;245"))
         rows.append(("  Ctrl-V: 클립보드 이미지를 원격 pane에 경로로 첨부",
+                     "38;5;245"))
+        rows.append(("  사이드바 SSH 키: 생성·공개키 복사·서버 설치·이름 변경·삭제",
                      "38;5;245"))
         return rows
 

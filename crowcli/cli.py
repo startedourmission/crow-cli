@@ -418,7 +418,16 @@ def run_attach(name):
                         "status": status,
                         "current": item["name"] == current})
                 return {"sessions": sessions,
-                        "hosts": fresh.data.get("hosts", [])}
+                        "hosts": fresh.data.get("hosts", []),
+                        "keys": key_entries(fresh, fingerprints=False)}
+
+            def delete_key(key, files):
+                try:
+                    _key, deleted = remove_key(key["name"], files)
+                except ValueError as error:
+                    return str(error)
+                return "%s: %s" % (key["name"], "파일까지 삭제함" if deleted
+                                   else "등록 해제함")
 
             client = Client(object(), status_provider=status_text,
                             explorer_root_provider=explorer_root,
@@ -429,7 +438,10 @@ def run_attach(name):
                             host_form={"keys": host_form_keys,
                                        "derive": derive_host_name,
                                        "save": host_form_save},
-                            image_target=image_target)
+                            image_target=image_target,
+                            key_actions={"list": key_entries,
+                                         "copy": copy_public_key,
+                                         "delete": delete_key})
             result = client.attach(name, window)
 
             def save_active_pane(reg, pane_id=client.last_active_pane_id):
@@ -519,6 +531,10 @@ def run_attach(name):
                     input("[Enter를 누르면 돌아갑니다] ")
                 except EOFError:
                     pass
+                continue
+            if result.action in ("key-generate", "key-rename",
+                                 "key-install"):
+                key_screen(result.action, result.arg, notice)
                 continue
             if result.action == "host-install-key":
                 record = host_record(result.arg)
@@ -1084,8 +1100,9 @@ def key_fingerprint(path):
             "type": parts[-1].strip("()")}
 
 
-def discover_system_keys():
-    """Private keys sitting in ~/.ssh (Crow's automatic discovery)."""
+def discover_system_keys(fingerprints=True):
+    """Private keys sitting in ~/.ssh (Crow's automatic discovery).
+    fingerprints=False skips ssh-keygen (cheap enough for the sidebar)."""
     base = os.path.expanduser("~/.ssh")
     found = []
     if not os.path.isdir(base):
@@ -1103,10 +1120,191 @@ def discover_system_keys():
             continue
         if b"PRIVATE KEY" not in head:
             continue
+        if not fingerprints:
+            found.append({"name": name, "path": path})
+            continue
         info = key_fingerprint(path)
         if info:
             found.append(dict({"name": name, "path": path}, **info))
     return found
+
+
+def key_entries(reg=None, fingerprints=True):
+    """Managed keys, then ~/.ssh keys not already managed; each with
+    origin, managed flag and the saved hosts that use it."""
+    reg = reg or registry_mod.load_registry()
+    hosts = reg.data.get("hosts", [])
+
+    def users(path):
+        return [h["name"] for h in hosts if h.get("identity")
+                and os.path.expanduser(h["identity"]) == path]
+    entries, seen = [], set()
+    for key in reg.data.get("keys", []):
+        path = os.path.expanduser(key["path"])
+        seen.add(path)
+        info = key_fingerprint(path) or {} if fingerprints else {}
+        entries.append(dict(info, name=key["name"], path=path,
+                            managed=True, imported=key.get("imported"),
+                            origin="관리됨", hosts=users(path)))
+    for key in discover_system_keys(fingerprints):
+        if key["path"] not in seen:
+            entries.append(dict(key, managed=False, origin="~/.ssh",
+                                hosts=users(key["path"])))
+    return entries
+
+
+def public_key_text(key):
+    """The one-line public key, or None (passphrase key without .pub)."""
+    pub_path = key["path"] + ".pub"
+    if os.path.isfile(pub_path):
+        with open(pub_path) as fh:
+            return fh.read().strip()
+    out = subprocess.run(["ssh-keygen", "-y", "-P", "", "-f", key["path"]],
+                         capture_output=True, text=True,
+                         stdin=subprocess.DEVNULL)
+    if out.returncode == 0:
+        return "%s %s" % (out.stdout.strip(), key["name"])
+    return None
+
+
+def copy_public_key(key):
+    """Public key -> macOS clipboard; returns a message for the UI."""
+    text = public_key_text(key)
+    if text is None:
+        return "공개키를 읽을 수 없어요 (%s.pub 없음)" % key["name"]
+    try:
+        subprocess.run(["pbcopy"], input=text, text=True, check=True,
+                       timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return "클립보드 복사 실패 (pbcopy 없음)"
+    return "%s 공개키를 클립보드에 복사했어요" % key["name"]
+
+
+def clean_key_name(name):
+    return re.sub(r"[^A-Za-z0-9_.-]+", "-", name or "").strip("-")
+
+
+def generate_key(name, passphrase="", key_type="ed25519"):
+    """ssh-keygen ~/.ssh/crow_NAME and register it; returns the record."""
+    name = clean_key_name(name)
+    if not name:
+        raise ValueError("키 이름이 필요합니다")
+    if find_key(registry_mod.load_registry(), name):
+        raise ValueError("이미 있는 키 이름입니다: %s" % name)
+    ssh_dir_path = os.path.expanduser("~/.ssh")
+    os.makedirs(ssh_dir_path, mode=0o700, exist_ok=True)
+    path = os.path.join(ssh_dir_path, "crow_" + name)
+    if os.path.exists(path):
+        raise ValueError("이미 있습니다: %s" % path)
+    gen = ["ssh-keygen", "-t", key_type, "-f", path, "-N", passphrase,
+           "-C", name + "@crow-cli"]
+    if key_type == "rsa":
+        gen[3:3] = ["-b", "4096"]
+    result = subprocess.run(gen, capture_output=True, text=True,
+                            stdin=subprocess.DEVNULL)
+    if result.returncode != 0:
+        raise ValueError("키 생성 실패: %s" % result.stderr.strip())
+    record = {"name": name, "path": path, "imported": False,
+              "created_at": time.time()}
+    with_registry(lambda reg: reg.data.setdefault("keys", []).append(record))
+    return record
+
+
+def rename_key(old, new):
+    new = clean_key_name(new)
+    if not new:
+        raise ValueError("새 이름이 필요합니다")
+
+    def rename(reg):
+        keys = reg.data.get("keys", [])
+        if any(k["name"] == new for k in keys):
+            raise ValueError("이미 있는 키 이름입니다: %s" % new)
+        for key in keys:
+            if key["name"] == old:
+                key["name"] = new
+                return new
+        raise ValueError("관리 중인 키가 아닙니다: %s" % old)
+    return with_registry(rename)
+
+
+def remove_key(name, delete_files=False):
+    """Unregister a managed key (and optionally its crow-generated
+    files). Keys still used by a saved host are refused."""
+    def remove(reg):
+        key = next((k for k in reg.data.get("keys", [])
+                    if k["name"] == name), None)
+        if key is None:
+            raise ValueError("관리 중인 키가 아닙니다. ~/.ssh 키는 "
+                             "파일로 직접 지우세요")
+        path = os.path.expanduser(key["path"])
+        users = [h["name"] for h in reg.data.get("hosts", [])
+                 if h.get("identity")
+                 and os.path.expanduser(h["identity"]) == path]
+        if users:
+            raise ValueError("%s 호스트가 사용 중인 키입니다. 호스트 키를 "
+                             "먼저 바꾸세요" % ", ".join(users))
+        reg.data["keys"].remove(key)
+        return key
+    key = with_registry(remove)
+    deleted = False
+    if delete_files and not key.get("imported"):
+        for target in (key["path"], key["path"] + ".pub"):
+            if os.path.exists(target):
+                os.unlink(target)
+                deleted = True
+    return key, deleted
+
+
+def bind_host_key(host_name, path):
+    def bind(reg):
+        saved = find_host(reg, host_name)
+        if saved:
+            saved["identity"] = path
+        return bool(saved)
+    return with_registry(bind)
+
+
+def key_screen(action, arg, notice):
+    """The UI key actions that need typing (name, passphrase, server
+    password) run on the plain terminal between attaches."""
+    sys.stdout.write("\x1b[2J\x1b[H")
+    sys.stdout.flush()
+    try:
+        if action == "key-generate":
+            print("[crow-cli] 새 SSH 키 (Ed25519, ~/.ssh/crow_<이름>)")
+            name = input("키 이름: ").strip()
+            passphrase = getpass.getpass("키 암호 [Enter면 없음]: ")
+            record = generate_key(name, passphrase)
+            info = key_fingerprint(record["path"]) or {}
+            print("✓ %s 생성됨 %s" % (record["name"], info.get("sha256", "")))
+            print(copy_public_key(dict(record)))
+            print("서버에 넣으려면: 사이드바 SSH 키 → %s → 서버에 공개키 설치"
+                  % record["name"])
+        elif action == "key-rename":
+            print("[crow-cli] 키 이름 변경: %s" % arg["name"])
+            new = rename_key(arg["name"], input("새 이름: ").strip())
+            print("✓ %s → %s" % (arg["name"], new))
+        elif action == "key-install":
+            key, host = arg
+            record = host_record(host)
+            print("[crow-cli] %s 공개키를 %s에 설치합니다 (서버 비밀번호를 "
+                  "한 번 물을 수 있어요)" % (key["name"], record["address"]))
+            if install_key(record, key):
+                if record.get("name") and \
+                        bind_host_key(record["name"], key["path"]):
+                    print("✓ %s 호스트의 키로 지정함" % record["name"])
+                notice["text"] = None
+            else:
+                print("✗ 설치 실패 — 주소/비밀번호를 확인하세요")
+                notice["text"] = "키 설치 실패: %s" % record["address"]
+    except ValueError as error:
+        print("✗ %s" % error)
+    except (KeyboardInterrupt, EOFError):
+        print("\n취소됨")
+    try:
+        input("[Enter를 누르면 돌아갑니다] ")
+    except (KeyboardInterrupt, EOFError):
+        pass
 
 
 def find_key(reg, ref):
@@ -1128,28 +1326,20 @@ def find_key(reg, ref):
 
 
 def cmd_keys(_args):
-    reg = registry_mod.load_registry()
-    managed = reg.data.get("keys", [])
-    managed_paths = set(os.path.expanduser(k["path"]) for k in managed)
-    rows = []
-    for key in managed:
-        info = key_fingerprint(key["path"]) or {}
-        rows.append((key["name"], info, key["path"], "관리됨"))
-    for key in discover_system_keys():
-        if key["path"] not in managed_paths:
-            rows.append((key["name"], key, key["path"], "~/.ssh"))
-    if not rows:
+    entries = key_entries()
+    if not entries:
         print("no ssh keys. Create one: crow key add work")
         return 0
-    for name, info, path, origin in rows:
-        print("%s: %s %s [%s] %s" % (
-            name, info.get("type", "?"), info.get("sha256", "?"),
-            origin, path))
+    for key in entries:
+        used = " (호스트: %s)" % ", ".join(key["hosts"]) if key["hosts"] else ""
+        print("%s: %s %s [%s] %s%s" % (
+            key["name"], key.get("type", "?"), key.get("sha256", "?"),
+            key["origin"], key["path"], used))
     return 0
 
 
 def cmd_key_add(args):
-    name = re.sub(r"[^A-Za-z0-9_.-]+", "-", args.name).strip("-")
+    name = clean_key_name(args.name)
     if not name:
         raise SystemExit("crow-cli: 키 이름이 필요합니다")
     if args.file:
@@ -1167,33 +1357,17 @@ def cmd_key_add(args):
         with_registry(add_imported)
         print("%s: %s 가져옴" % (name, path))
         return 0
-    ssh_dir_path = os.path.expanduser("~/.ssh")
-    os.makedirs(ssh_dir_path, mode=0o700, exist_ok=True)
-    path = os.path.join(ssh_dir_path, "crow_" + name)
-    if os.path.exists(path):
-        raise SystemExit("crow-cli: 이미 있습니다: %s" % path)
     passphrase = args.passphrase
     if passphrase is None:
         passphrase = getpass.getpass("키 암호 [Enter면 없음]: ") \
             if sys.stdin.isatty() else ""
-    gen = ["ssh-keygen", "-t", args.type, "-f", path, "-N", passphrase,
-           "-C", name + "@crow-cli"]
-    if args.type == "rsa":
-        gen = ["ssh-keygen", "-t", "rsa", "-b", "4096", "-f", path,
-               "-N", passphrase, "-C", name + "@crow-cli"]
-    result = subprocess.run(gen, capture_output=True, text=True)
-    if result.returncode != 0:
-        raise SystemExit("crow-cli: 키 생성 실패: %s"
-                         % result.stderr.strip())
-    record = {"name": name, "path": path, "imported": False,
-              "created_at": time.time()}
-
-    def add_generated(reg):
-        reg.data.setdefault("keys", []).append(record)
-    with_registry(add_generated)
-    info = key_fingerprint(path) or {}
+    try:
+        record = generate_key(name, passphrase, args.type)
+    except ValueError as error:
+        raise SystemExit("crow-cli: %s" % error)
+    info = key_fingerprint(record["path"]) or {}
     print("%s: %s %s 생성됨 (%s)" % (name, info.get("type", "?"),
-                                     info.get("sha256", ""), path))
+                                     info.get("sha256", ""), record["path"]))
     print("서버에 설치: crow key install %s <호스트>" % name)
     return 0
 
@@ -1207,52 +1381,44 @@ def cmd_key_show(args):
     print("%s: %s %s" % (key["name"], info.get("type", "?"),
                          info.get("sha256", "?")))
     print("개인키: %s" % key["path"])
-    pub_path = key["path"] + ".pub"
-    if os.path.isfile(pub_path):
-        with open(pub_path) as fh:
-            print("공개키: " + fh.read().strip())
-    else:
-        out = subprocess.run(["ssh-keygen", "-y", "-f", key["path"]],
-                             capture_output=True, text=True)
-        if out.returncode == 0:
-            print("공개키: %s %s" % (out.stdout.strip(), key["name"]))
-        else:
-            print("공개키: (암호가 걸린 키 — %s.pub 파일이 없습니다)"
-                  % key["path"])
+    text = public_key_text(key)
+    print("공개키: " + (text or "(암호가 걸린 키 — %s.pub 파일이 없습니다)"
+                        % key["path"]))
+    return 0
+
+
+def cmd_key_copy(args):
+    key = find_key(registry_mod.load_registry(), args.name)
+    if key is None:
+        raise SystemExit("crow-cli: no such key %r (crow keys)" % args.name)
+    print(copy_public_key(key))
+    return 0
+
+
+def cmd_key_rename(args):
+    try:
+        new = rename_key(args.name, args.new_name)
+    except ValueError as error:
+        raise SystemExit("crow-cli: %s" % error)
+    print("%s → %s" % (args.name, new))
     return 0
 
 
 def cmd_key_rm(args):
-    def remove(reg):
-        key = None
-        for candidate in reg.data.get("keys", []):
-            if candidate["name"] == args.name:
-                key = candidate
-        if key is None:
-            raise SystemExit("crow-cli: 관리 중인 키가 아닙니다. "
-                             "~/.ssh 시스템 키는 파일로 직접 지우세요")
-        users = [h["name"] for h in reg.data.get("hosts", [])
-                 if h.get("identity")
-                 and os.path.expanduser(h["identity"]) == key["path"]]
-        if users:
-            raise SystemExit("crow-cli: %s 호스트가 사용 중인 키입니다. "
-                             "호스트 키를 먼저 바꾸세요" % ", ".join(users))
-        reg.data["keys"].remove(key)
-        return key
-    key = with_registry(remove)
-    if not key.get("imported") and os.path.isfile(key["path"]):
-        if not args.force:
-            answer = input("%s 와 .pub 파일을 지울까요? [y/N] "
-                           % key["path"]).strip().lower()
-            if answer != "y":
-                print("등록만 해제했습니다 (파일은 남김)")
-                return 0
-        for target in (key["path"], key["path"] + ".pub"):
-            if os.path.exists(target):
-                os.unlink(target)
-        print("%s: 파일까지 삭제함" % args.name)
-    else:
-        print("%s: 등록 해제 (원본 파일은 그대로)" % args.name)
+    reg = registry_mod.load_registry()
+    key = next((k for k in reg.data.get("keys", [])
+                if k["name"] == args.name), None)
+    delete_files = False
+    if key and not key.get("imported") and os.path.isfile(key["path"]):
+        delete_files = args.force or input(
+            "%s 와 .pub 파일도 지울까요? [y/N] " % key["path"]
+        ).strip().lower() == "y"
+    try:
+        _key, deleted = remove_key(args.name, delete_files)
+    except ValueError as error:
+        raise SystemExit("crow-cli: %s" % error)
+    print("%s: %s" % (args.name, "파일까지 삭제함" if deleted
+                      else "등록 해제 (파일은 그대로)"))
     return 0
 
 
@@ -1661,6 +1827,13 @@ def build_parser():
     kp = key_sub.add_parser("show", help="지문 + 공개키 표시")
     kp.add_argument("name")
     kp.set_defaults(fn=cmd_key_show)
+    kp = key_sub.add_parser("copy", help="공개키를 클립보드에 복사")
+    kp.add_argument("name")
+    kp.set_defaults(fn=cmd_key_copy)
+    kp = key_sub.add_parser("rename", help="관리 키 이름 변경")
+    kp.add_argument("name")
+    kp.add_argument("new_name")
+    kp.set_defaults(fn=cmd_key_rename)
     kp = key_sub.add_parser("rm", help="키 삭제/등록 해제")
     kp.add_argument("name")
     kp.add_argument("--force", action="store_true")

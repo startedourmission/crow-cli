@@ -148,10 +148,19 @@ crow keys                    # 키 목록 (관리 키 + ~/.ssh 자동 발견, �
 crow key add work            # Ed25519 키 생성 (~/.ssh/crow_work)
 crow key add old --file ~/.ssh/id_rsa   # 기존 키 가져오기
 crow key show work           # 지문 + 공개키 (복사용)
+crow key copy work           # 공개키를 클립보드에 복사
+crow key rename work home    # 관리 키 이름 변경
 crow key install work mac    # 공개키를 서버 authorized_keys에 설치
 crow key rm work             # 호스트가 쓰는 중인 키는 삭제 거부
 crow host add mac --address user@host --key work   # 키 이름으로 호스트에 연결
 ```
+
+UI에서는 사이드바 **SSH 키** 섹션에서 키를 누르거나 `+ 키 관리…`로
+오른쪽 패널을 엽니다. 키별로 **공개키 복사 / 서버에 설치(호스트 선택 →
+그 호스트의 키로 지정) / 이름 변경 / 삭제(등록만 해제 또는 파일까지)**,
+목록 끝의 `+ 새 키 생성`으로 Ed25519 키를 만들 수 있습니다. 이름·암호·
+서버 비밀번호처럼 입력이 필요한 단계는 잠깐 일반 터미널로 나왔다가
+Enter로 돌아옵니다.
 
 키는 Crow처럼 라이브러리로 관리하되 저장소는 시스템 도구
 (`ssh-keygen`/`ssh-copy-id`/`~/.ssh`)를 그대로 씁니다.
