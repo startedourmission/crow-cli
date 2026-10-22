@@ -87,6 +87,13 @@ class VtTests(unittest.TestCase):
         self.assertEqual(screen.grid[0][2][0], "가")
         self.assertEqual(screen.grid[0][3][0], "")  # wide continuation
 
+    def test_keyboard_mode_sequences_are_not_styles(self):
+        screen = Screen(10, 1)
+        screen.feed(b"ab\x1b[s\x1b[>4;2m\x1b[>4m\x1b[>1u\x1b[<u\x1b[>0qcd")
+        self.assertEqual("".join(c[0] for c in screen.grid[0][:4]), "abcd")
+        self.assertFalse(any(c[1][5] for c in screen.grid[0]))  # underline
+        self.assertEqual(screen.responses, [])
+
 
 class PaneAttachTests(unittest.TestCase):
     def setUp(self):

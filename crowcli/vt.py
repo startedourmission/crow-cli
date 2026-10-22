@@ -302,11 +302,15 @@ class Screen(object):
 
     def _csi(self, raw, final):
         self._eol_candidate = None
+        if raw[:1] in ("<", ">", "="):
+            # xterm/kitty keyboard modes, XTVERSION, DA2...: never SGR,
+            # cursor restore or mode changes on this screen.
+            return
         private = raw.startswith("?")
         values = self._params(raw)
         n = values[0] or 1
         if final == "m" and not private:
-            self._sgr(raw.lstrip("?<>=!"))
+            self._sgr(raw)
         elif final == "A":
             self.cy = max(self.top if self.origin else 0, self.cy - n)
             self.wrap_pending = False
