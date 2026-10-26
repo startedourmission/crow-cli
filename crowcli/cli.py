@@ -445,7 +445,8 @@ def run_attach(name):
                             key_actions={"list": key_entries,
                                          "copy": copy_public_key,
                                          "delete": delete_key})
-            result = client.attach(name, window)
+            result = client.attach(name, window, others=[
+                w for w in session["windows"] if w["id"] != window["id"]])
 
             def save_active_pane(reg, pane_id=client.last_active_pane_id):
                 found = reg.find(name)

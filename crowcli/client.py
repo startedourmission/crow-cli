@@ -120,6 +120,120 @@ class PaneRuntime(object):
         self.conn = daemon_mod.Daemon.connect(self.id, root=self.root())
         return self.conn is not None
 
+    def consume(self):
+        """Apply buffered frames: (screen changed, exit code or None)."""
+        changed = False
+        for kind, payload in self.conn.frames():
+            if kind == "O":
+                if self.awaiting_replay and payload != b"\x1bc":
+                    self.awaiting_replay = False
+                    self.screen.feed_replay(payload)
+                    # queries in old output were answered back then
+                    self.screen.responses = []
+                else:
+                    self.screen.feed(payload)
+                changed = True
+                for response in self.screen.responses:
+                    try:
+                        self.conn.send("D", response)
+                    except socket.error:
+                        pass
+                self.screen.responses = []
+            elif kind == "X":
+                code = struct.unpack(">I", payload[:4])[0] \
+                    if len(payload) >= 4 else 0
+                return changed, code
+        return changed, None
+
+
+class PaneCache(object):
+    """Pane connections and screens kept alive between the Client runs
+    of one crow process (window switch, split, zoom), so coming back
+    needs no replay. A background thread keeps parked screens current."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.parked = {}
+        self.live = set()  # pane ids the attached Client owns right now
+        self.thread = None
+
+    def park(self, runtime):
+        if runtime.conn is None:
+            return
+        with self.lock:
+            old = self.parked.pop(runtime.id, None)
+            self.parked[runtime.id] = runtime
+        if old is not None and old.conn is not runtime.conn:
+            old.conn.close()
+        if self.thread is None:
+            self.thread = threading.Thread(target=self._run, daemon=True)
+            self.thread.start()
+
+    def take(self, pane_id):
+        with self.lock:
+            return self.parked.pop(pane_id, None)
+
+    def prefetch(self, entries):
+        """Connect and replay panes of windows not on screen yet.
+        entries: (pane, window, (cols, rows)) with the size the pane's
+        pty already has, so the replayed screen lines up."""
+        for pane, window, size in entries:
+            with self.lock:
+                if pane["id"] in self.parked or pane["id"] in self.live:
+                    continue
+            runtime = PaneRuntime(pane, window)
+            if size:
+                runtime.screen.resize(*size)
+            if not runtime.connect():
+                continue
+            try:
+                runtime.conn.send("A")
+                runtime.conn.sock.setblocking(False)
+            except socket.error:
+                runtime.conn.close()
+                continue
+            runtime.awaiting_replay = True
+            self.park(runtime)
+
+    def _drop(self, pane_id):
+        runtime = self.parked.pop(pane_id, None)
+        if runtime is not None:
+            runtime.conn.close()
+
+    def _run(self):
+        while True:
+            with self.lock:
+                socks = dict((r.conn.sock, r.id)
+                             for r in self.parked.values())
+            if not socks:
+                time.sleep(0.1)
+                continue
+            try:
+                ready = select.select(list(socks), [], [], 0.1)[0]
+            except (OSError, ValueError):  # a socket closed under us
+                time.sleep(0.05)
+                continue
+            with self.lock:
+                for sock in ready:
+                    runtime = self.parked.get(socks[sock])
+                    if runtime is None or runtime.conn.sock is not sock:
+                        continue  # taken back by the attached client
+                    try:
+                        data = sock.recv(65536)
+                    except BlockingIOError:
+                        continue
+                    except socket.error:
+                        data = b""
+                    if not data:
+                        self._drop(runtime.id)
+                        continue
+                    runtime.conn.feed(data)
+                    if runtime.consume()[1] is not None:
+                        self._drop(runtime.id)
+
+
+PANE_CACHE = PaneCache()
+
 
 class Client(object):
     def __init__(self, hooks, status_provider=None,
@@ -236,8 +350,32 @@ class Client(object):
             self.runtimes[0] if self.runtimes else None)
 
     # -- attach ---------------------------------------------------------------
-    def attach(self, session_name, window):
-        """Block until detach / window exit / switch / split request."""
+    PREFETCH_DELAY = 1.0
+
+    def _prefetch(self, windows):
+        """Warm PANE_CACHE with the session's other windows once this
+        one is on screen, so the first switch to them is instant too."""
+        entries = []
+        for win in windows:
+            panes = registry_mod.window_panes(win)
+            rects = compute_rects(win.get("layout"),
+                                  dict((p["id"], p) for p in panes),
+                                  *self._area(), zoomed=win.get("zoomed"))
+            for pane in panes:
+                rect = rects.get(pane["id"])
+                entries.append((pane, win, (rect[2], rect[3]) if rect
+                                else None))
+        PANE_CACHE.prefetch(entries)
+
+    def attach(self, session_name, window, others=()):
+        """Block until detach / window exit / switch / split request.
+        `others`: the session's other windows, preloaded in the
+        background."""
+        if others:
+            timer = threading.Timer(self.PREFETCH_DELAY, self._prefetch,
+                                    args=(list(others),))
+            timer.daemon = True
+            timer.start()
         self._session_name = session_name
         self._window = window
         panes = registry_mod.window_panes(window)
@@ -245,13 +383,28 @@ class Client(object):
             raise RuntimeError("window has no panes")
         active = registry_mod.active_pane(window)
         self.active_id = active["id"] if active else panes[0]["id"]
-        self.runtimes = [PaneRuntime(p, window) for p in panes]
+        self.runtimes = []
+        with PANE_CACHE.lock:
+            PANE_CACHE.live = set(p["id"] for p in panes)
+        for pane in panes:
+            runtime = PaneRuntime(pane, window)
+            parked = PANE_CACHE.take(pane["id"])
+            if parked is not None:
+                runtime.conn, runtime.screen = parked.conn, parked.screen
+                runtime.awaiting_replay = parked.awaiting_replay
+                runtime.cached = True
+            self.runtimes.append(runtime)
         missing = []
         for runtime in self.runtimes:
+            if getattr(runtime, "cached", False):
+                continue
             if not runtime.connect():
                 code = daemon_mod.has_exited(runtime.id,
                                              root=runtime.root())
                 if code is not None:
+                    for other in self.runtimes:
+                        if other.conn is not None:
+                            PANE_CACHE.park(other)
                     return AttachResult("dead", (runtime.id, code))
                 missing.append(runtime.pane["name"])
         if missing:
@@ -262,6 +415,7 @@ class Client(object):
         self._resize = False
         old_handler = signal.signal(signal.SIGWINCH, self._on_resize)
         out = sys.stdout.buffer
+        result = None
         try:
             tty.setraw(stdin_fd)
             _, rows = self._winsize()
@@ -274,10 +428,12 @@ class Client(object):
             self._probe_outer_colors(out, stdin_fd)
             for runtime in self.runtimes:
                 rect = rects.get(runtime.id)
-                if rect:
+                if rect and (runtime.screen.cols, runtime.screen.rows) \
+                        != (rect[2], rect[3]):
                     runtime.screen.resize(rect[2], rect[3])
-                runtime.awaiting_replay = True
-                runtime.conn.send("A")
+                if not getattr(runtime, "cached", False):
+                    runtime.awaiting_replay = True
+                    runtime.conn.send("A")
                 if rect:
                     runtime.conn.send_size(rect[2], rect[3])
                 runtime.conn.sock.setblocking(False)
@@ -287,8 +443,14 @@ class Client(object):
         finally:
             self._restore_ime()
             self.last_active_pane_id = self.active_id
+            keep = result is not None and result.action != "detach"
             for runtime in self.runtimes:
-                if runtime.conn:
+                if not runtime.conn:
+                    continue
+                if keep and not (result.action == "dead"
+                                 and result.arg[0] == runtime.id):
+                    PANE_CACHE.park(runtime)
+                else:
                     runtime.conn.close()
             out.write(b"\x1b[r"
                       b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l"
@@ -984,26 +1146,10 @@ class Client(object):
                                  daemon_mod.has_exited(
                                      runtime.id, root=runtime.root())))
                 runtime.conn.feed(data)
-                for kind, payload in runtime.conn.frames():
-                    if kind == "O":
-                        if runtime.awaiting_replay and payload != b"\x1bc":
-                            runtime.awaiting_replay = False
-                            runtime.screen.feed_replay(payload)
-                            # queries in old output were answered back then
-                            runtime.screen.responses = []
-                        else:
-                            runtime.screen.feed(payload)
-                        changed = True
-                        for response in runtime.screen.responses:
-                            try:
-                                runtime.conn.send("D", response)
-                            except socket.error:
-                                pass
-                        runtime.screen.responses = []
-                    elif kind == "X":
-                        code = struct.unpack(">I", payload[:4])[0] \
-                            if len(payload) >= 4 else 0
-                        return AttachResult("dead", (runtime.id, code))
+                fed, code = runtime.consume()
+                changed = changed or fed
+                if code is not None:
+                    return AttachResult("dead", (runtime.id, code))
             if changed:
                 paint_due = True
             if paint_due and time.time() - self._last_draw >= 0.016:

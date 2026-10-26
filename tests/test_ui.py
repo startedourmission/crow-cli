@@ -2,6 +2,7 @@
 import os
 from pathlib import Path
 import pty
+import re
 import select
 import struct
 import subprocess
@@ -102,6 +103,30 @@ class UiTests(unittest.TestCase):
                                      check=False).returncode, 0)
         self.cli("host", "rm", "box")
         self.assertIn("no saved hosts", self.cli("hosts").stdout)
+
+    def test_window_switch_keeps_background_screens_current(self):
+        from crowcli.vt import Screen
+        self.cli("new", "-d", "-s", "demo", "-c", self.ws.name, "--",
+                 "echo ZERO; exec /bin/sh")
+        self.cli("new-window", "-t", "demo", "-c", self.ws.name, "--",
+                 "i=0; while [ $i -lt 400 ]; do i=$((i+1)); "
+                 "echo tick-$i; sleep 0.05; done; exec /bin/sh")
+        self.cli("select-window", "-t", "demo:0")
+        out = self.attach([
+            (b"\x02n", 1.0),   # window 1 (fresh replay)
+            (b"\x02n", 2.0),   # back to 0; window 1 keeps ticking parked
+            (b"\x02n", 0.3),   # window 1 again, served from the cache
+            (b"\x02d", 1.0),
+        ])
+        screen = Screen(80, 24)
+        # Only the frames painted after the last switch matter.
+        screen.feed(out[:out.rfind(b"\x1b[?1049l")])
+        text = "\n".join("".join(c[0] for c in row) for row in screen.grid)
+        ticks = [int(t) for t in re.findall(r"tick-(\d+)", text)]
+        self.assertTrue(ticks, text)
+        # ~3.3s at 20 ticks/s: the parked screen saw the 2s it was away.
+        self.assertGreater(max(ticks), 45, text)
+        self.assertNotIn("ZERO", text)
 
     def test_mouse_click_focuses_pane_and_wheel_does_not_crash(self):
         self.cli("new", "-d", "-s", "demo", "-c", self.ws.name, "--",
