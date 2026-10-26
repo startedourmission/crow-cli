@@ -128,6 +128,48 @@ class UiTests(unittest.TestCase):
         self.assertGreater(max(ticks), 45, text)
         self.assertNotIn("ZERO", text)
 
+    def test_window_switch_does_not_toggle_alternate_screen(self):
+        self.cli("new", "-d", "-s", "demo", "-c", self.ws.name, "--",
+                 "exec /bin/sh")
+        self.cli("new-window", "-t", "demo", "-c", self.ws.name, "--",
+                 "exec /bin/sh")
+        out = self.attach([(b"\x02n", 0.8), (b"\x02n", 0.8),
+                           (b"\x02d", 1.0)])
+        self.assertEqual(out.count(b"\x1b[?1049h"), 1)
+        self.assertEqual(out.count(b"\x1b[?1049l"), 1)  # only at detach
+        self.assertTrue(out.rstrip().endswith(b"(still running)"), out[-200:])
+
+    def test_sighup_dumps_flight_recorder(self):
+        import signal
+        self.cli("new", "-d", "-s", "demo", "-c", self.ws.name, "--",
+                 "echo RECORDED-OUTPUT; exec /bin/sh")
+        master, slave = pty.openpty()
+        import fcntl
+        fcntl.ioctl(slave, termios.TIOCSWINSZ,
+                    struct.pack("HHHH", 24, 80, 0, 0))
+        proc = subprocess.Popen([CROW, "attach", "-t", "demo"],
+                                stdin=slave, stdout=slave, stderr=slave,
+                                env=self.env)
+        os.close(slave)
+        end = time.time() + 2
+        while time.time() < end:
+            if select.select([master], [], [], 0.05)[0]:
+                os.read(master, 65536)
+        os.write(master, b"\x1b[<0;40;5M")
+        time.sleep(0.3)
+        proc.send_signal(signal.SIGHUP)
+        proc.wait(timeout=10)
+        os.close(master)
+        crash = Path(self.home.name) / "crash"
+        outs = list(crash.glob("*.out"))
+        self.assertEqual(len(outs), 1)
+        self.assertIn(b"RECORDED-OUTPUT", outs[0].read_bytes())
+        log = outs[0].with_suffix(".log").read_text()
+        self.assertIn("reason: SIGHUP", log)
+        self.assertIn("attach", log)
+        self.assertIn("[<0;40;5M", log)
+        self.assertEqual(oct(outs[0].stat().st_mode & 0o777), "0o600")
+
     def test_mouse_click_focuses_pane_and_wheel_does_not_crash(self):
         self.cli("new", "-d", "-s", "demo", "-c", self.ws.name, "--",
                  "exec /bin/sh")

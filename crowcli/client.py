@@ -20,7 +20,7 @@ import threading
 import time
 import tty
 
-from . import clipimage, daemon as daemon_mod, imswitch, \
+from . import clipimage, daemon as daemon_mod, imswitch, outtrace, \
     registry as registry_mod
 from .vt import DEFAULT_ATTR, Screen, char_width, sgr_for
 
@@ -414,7 +414,9 @@ class Client(object):
         old = termios.tcgetattr(stdin_fd)
         self._resize = False
         old_handler = signal.signal(signal.SIGWINCH, self._on_resize)
-        out = sys.stdout.buffer
+        out = outtrace.Writer(sys.stdout.buffer)
+        outtrace.install()
+        outtrace.note("attach", "%s:%s" % (session_name, window.get("name")))
         result = None
         try:
             tty.setraw(stdin_fd)
@@ -422,8 +424,15 @@ class Client(object):
             # Reserve the last row: the outer terminal's scroll region is
             # everything above it, so nothing (scrolling, full-width
             # writes, app redraws) can ever roll over the status bar.
-            out.write(b"\x1b[?1049h\x1b[?25l\x1b[?1002h\x1b[?1006h"
-                      + ("\x1b[1;%dr" % max(1, rows - 1)).encode())
+            region = ("\x1b[1;%dr" % max(1, rows - 1)).encode()
+            if Client._term_active:
+                # Straight back from a window switch: same screen, modes
+                # still on; just wipe the old window's cells.
+                out.write(b"\x1b[?25l" + region + b"\x1b[2J")
+            else:
+                out.write(b"\x1b[?1049h\x1b[?25l\x1b[?1002h\x1b[?1006h"
+                          + region)
+            Client._term_active = True
             out.flush()
             self._probe_outer_colors(out, stdin_fd)
             for runtime in self.runtimes:
@@ -452,14 +461,32 @@ class Client(object):
                     PANE_CACHE.park(runtime)
                 else:
                     runtime.conn.close()
-            out.write(b"\x1b[r"
-                      b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l"
-                      b"\x1b[?2004l\x1b[?1l\x1b[?25h\x1b[?1049l")
+            outtrace.note("result", result.action if result else "error")
+            if result is None or result.action not in self.SEAMLESS:
+                out.write(self.LEAVE)
+                Client._term_active = False
             out.flush()
             signal.signal(signal.SIGWINCH, old_handler)
             termios.tcsetattr(stdin_fd, termios.TCSANOW, old)
 
     _colors_probed = False  # class-wide: once per crow process
+    # Results that re-attach right away without printing anything: the
+    # outer terminal stays in the alternate screen with crow's modes on
+    # (toggling it per window switch is churn Terminal.app doesn't need).
+    SEAMLESS = ("switch", "switch-session", "split-v", "split-h", "zoom",
+                "new", "open-file", "ssh-connect")
+    _term_active = False
+    LEAVE = (b"\x1b[r\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l"
+             b"\x1b[?2004l\x1b[?1l\x1b[?25h\x1b[?1049l")
+
+    @classmethod
+    def leave_terminal(cls):
+        """Undo the alternate screen + modes if a seamless switch left
+        them on and no attach followed (error between runs)."""
+        if cls._term_active:
+            cls._term_active = False
+            sys.stdout.buffer.write(cls.LEAVE)
+            sys.stdout.buffer.flush()
 
     def _probe_outer_colors(self, out, stdin_fd):
         """Ask the real terminal for its default fg/bg (OSC 10/11) so
@@ -1159,6 +1186,7 @@ class Client(object):
                 data = os.read(stdin_fd, 65536)
                 if not data:
                     return AttachResult("detach")
+                outtrace.typed(data)
                 result = self._input(data, rects)
                 if result is not None:
                     return result

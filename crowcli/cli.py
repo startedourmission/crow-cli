@@ -707,6 +707,7 @@ def run_attach(name):
     finally:
         for proc in forwards:
             proc.terminate()
+        Client.leave_terminal()
 
 
 # -------------------------------------------------------------- commands
