@@ -446,7 +446,11 @@ class Client(object):
                 if rect:
                     runtime.conn.send_size(rect[2], rect[3])
                 runtime.conn.sock.setblocking(False)
-            result = self._loop(out, stdin_fd)
+            try:
+                result = self._loop(out, stdin_fd)
+            except OSError as error:  # EIO writing to a dead terminal
+                outtrace.dump("terminal write failed: %s" % error)
+                raise
             self.last_active_pane_id = self.active_id
             return result
         finally:
@@ -462,10 +466,13 @@ class Client(object):
                 else:
                     runtime.conn.close()
             outtrace.note("result", result.action if result else "error")
-            if result is None or result.action not in self.SEAMLESS:
-                out.write(self.LEAVE)
+            try:
+                if result is None or result.action not in self.SEAMLESS:
+                    out.write(self.LEAVE)
+                    Client._term_active = False
+                out.flush()
+            except OSError:
                 Client._term_active = False
-            out.flush()
             signal.signal(signal.SIGWINCH, old_handler)
             termios.tcsetattr(stdin_fd, termios.TCSANOW, old)
 
@@ -1183,8 +1190,14 @@ class Client(object):
                 self._render(out, rects)
                 paint_due = False
             if stdin_fd in ready:
-                data = os.read(stdin_fd, 65536)
+                try:
+                    data = os.read(stdin_fd, 65536)
+                except OSError:  # EIO: the terminal went away
+                    data = b""
                 if not data:
+                    # Terminal window/app gone (crash or close): keep the
+                    # flight recorder before anything else can fail.
+                    outtrace.dump("terminal input closed")
                     return AttachResult("detach")
                 outtrace.typed(data)
                 result = self._input(data, rects)

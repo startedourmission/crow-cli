@@ -5,6 +5,10 @@ buffer, so the terminal sends nothing until the syllable is committed. Prefix
 commands therefore switch to ABC while they wait for a key and switch back
 afterwards. Everything here is best-effort: on other platforms, or when the
 Carbon APIs are unavailable, the functions do nothing.
+
+Off unless CROWCLI_IME_SWITCH=1: switching the system input source from
+another process while Terminal.app is mid-composition is the prime suspect
+for its heap-corruption crashes.
 """
 
 import ctypes
@@ -21,7 +25,8 @@ def _load():
     if _api is not None:
         return _api or None
     _api = False
-    if sys.platform != "darwin" or os.environ.get("CROWCLI_NO_IME_SWITCH"):
+    if sys.platform != "darwin" or os.environ.get("CROWCLI_NO_IME_SWITCH") \
+            or os.environ.get("CROWCLI_IME_SWITCH") != "1":
         return None
     try:
         carbon = ctypes.cdll.LoadLibrary(

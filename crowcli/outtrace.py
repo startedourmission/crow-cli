@@ -69,7 +69,19 @@ class Writer(object):
         return self.raw.flush()
 
 
+_dumped = None
+
+
 def dump(reason):
+    """Write the recorder out once per process (SIGHUP, EOF and EIO can
+    all fire for the same terminal death)."""
+    global _dumped
+    if _dumped is None:
+        _dumped = _write(reason)
+    return _dumped
+
+
+def _write(reason):
     folder = os.path.join(registry_mod.home(), "crash")
     os.makedirs(folder, mode=0o700, exist_ok=True)
     # Closing a window also sends SIGHUP: keep only the latest few.

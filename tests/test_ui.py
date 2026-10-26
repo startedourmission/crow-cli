@@ -170,6 +170,29 @@ class UiTests(unittest.TestCase):
         self.assertIn("[<0;40;5M", log)
         self.assertEqual(oct(outs[0].stat().st_mode & 0o777), "0o600")
 
+    def test_terminal_vanishing_dumps_flight_recorder(self):
+        # A crashed terminal app closes the pty: the client sees EOF/EIO,
+        # often before any SIGHUP, and must still keep the record.
+        self.cli("new", "-d", "-s", "demo", "-c", self.ws.name, "--",
+                 "echo VANISHED-OUTPUT; exec /bin/sh")
+        master, slave = pty.openpty()
+        import fcntl
+        fcntl.ioctl(slave, termios.TIOCSWINSZ,
+                    struct.pack("HHHH", 24, 80, 0, 0))
+        proc = subprocess.Popen([CROW, "attach", "-t", "demo"],
+                                stdin=slave, stdout=slave, stderr=slave,
+                                env=self.env, start_new_session=True)
+        os.close(slave)
+        end = time.time() + 2
+        while time.time() < end:
+            if select.select([master], [], [], 0.05)[0]:
+                os.read(master, 65536)
+        os.close(master)
+        proc.wait(timeout=10)
+        outs = list((Path(self.home.name) / "crash").glob("*.out"))
+        self.assertEqual(len(outs), 1)
+        self.assertIn(b"VANISHED-OUTPUT", outs[0].read_bytes())
+
     def test_mouse_click_focuses_pane_and_wheel_does_not_crash(self):
         self.cli("new", "-d", "-s", "demo", "-c", self.ws.name, "--",
                  "exec /bin/sh")
