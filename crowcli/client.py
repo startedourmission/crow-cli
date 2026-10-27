@@ -743,13 +743,13 @@ class Client(object):
         for host in data.get("hosts", []):
             state, color = self._host_state(host)
             failed = state.startswith("연결 실패")
+            style = tone["31"] + ";" + bg if failed \
+                else tone.get(color, color) + ";" + bg
             lines.append((" ✗ " + host.get("name", "?") if failed
                           else " ● " + host.get("name", "?"),
-                          fail_style if failed else tone.get(color, color) + ";" + bg,
+                          "1;" + style if failed else style,
                           ("reverse-host", host)))
-            lines.append(("   " + state,
-                          fail_style if failed else tone.get(color, color) + ";" + bg,
-                          ("reverse-host", host)))
+            lines.append(("   " + state, style, ("reverse-host", host)))
         if not data.get("hosts"):
             lines.append((" (없음 — 아래에서 추가)",
                           "38;5;245;" + bg, None))

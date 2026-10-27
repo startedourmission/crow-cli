@@ -333,6 +333,12 @@ class FailureDisplayTests(unittest.TestCase):
         self.assertIn("리버스 시작 실패".encode(), out)
         self.assertIn(b"48;5;160", out)  # red background
         self.assertIn("✗".encode(), out)
+        # A failed host is red text on the normal sidebar, not a red block.
+        host_row = re.search(rb"\x1b\[([\d;]*)m ?\xe2\x9c\x97 mac", out)
+        self.assertEqual(host_row.group(1), b"1;38;5;160;48;5;231")
+        state_row = re.search("\x1b\\[([\\d;]*)m   연결 실패 \\(인증".encode(),
+                              out)
+        self.assertEqual(state_row.group(1), b"38;5;160;48;5;231")
 
 
 class HelpPopupTests(unittest.TestCase):
