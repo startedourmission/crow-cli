@@ -152,7 +152,8 @@ SSH 세션 pane에서 `Ctrl-V`를 누르면 Mac 클립보드의 이미지를 PNG
 CLI도 같습니다:
 
 ```sh
-crow ssh mac                 # ssh 접속을 세션으로 열기 (끊겨도 pane 유지)
+crow ssh mac                 # ssh 접속을 세션으로 열기 (끊기면 Enter 재접속 · q 끊기 · s 로컬 셸)
+crow host disconnect mac     # ssh 세션 닫기 (사이드바 호스트 메뉴: SSH 연결 끊기)
 crow host check mac          # 연결 + 키 인증 확인 (어떤 키로 되는지/실패 이유)
 crow keys                    # 키 목록 (관리 키 + ~/.ssh 자동 발견, 지문 표시)
 crow key add work            # Ed25519 키 생성 (~/.ssh/crow_work)

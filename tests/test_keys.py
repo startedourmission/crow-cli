@@ -120,6 +120,23 @@ class KeyTests(unittest.TestCase):
         self.assertIn("ssh-bad", listing)
         self.assertIn("[ssh]", listing)
 
+    def test_ssh_drop_prompts_and_disconnect_closes(self):
+        import time
+        self.cli("host", "add", "bad", "--address", "root@127.0.0.1",
+                 "--port", "1")
+        self.cli("ssh", "bad", "-d")
+        deadline, screen = time.time() + 10, ""
+        while time.time() < deadline and "Enter: 다시 접속" not in screen:
+            time.sleep(0.2)
+            screen = self.cli("capture", "-t", "ssh-bad").stdout
+        self.assertIn("ssh 연결이 끊겼습니다", screen)
+        self.assertIn("q: 연결 끊기", screen)
+        self.assertIn("closed ssh-bad",
+                      self.cli("host", "disconnect", "bad").stdout)
+        self.assertNotIn("ssh-bad", self.cli("ls").stdout)
+        again = self.cli("host", "disconnect", "bad", check=False)
+        self.assertNotEqual(again.returncode, 0)
+
 
 class HostMenuTests(unittest.TestCase):
     def test_host_menu_actions(self):
@@ -145,6 +162,26 @@ class HostMenuTests(unittest.TestCase):
         client._reverse_key(b"q")
         self.assertEqual(client.reverse_stage, "menu")
         self.assertTrue(client.reverse_open)
+        self.assertFalse(any(row["kind"] == "disconnect"
+                             for row in client._reverse_rows()))
+
+    def test_host_menu_disconnect_when_ssh_open(self):
+        import sys
+        sys.path.insert(0, str(REPO))
+        from crowcli.client import Client
+        host = {"name": "mac", "address": "u@192.0.2.1",
+                "ssh_session": "ssh-mac"}
+        client = Client(object(), reverse_data_provider=lambda: {
+            "hosts": [host]})
+        client._open_reverse_for_host(host)
+        rows = client._reverse_rows()
+        self.assertEqual(rows[0]["label"], "SSH 세션으로 이동")
+        client.reverse_sel = 1
+        self.assertEqual(rows[1]["kind"], "disconnect")
+        result = client._reverse_activate()
+        self.assertEqual(result.action, "host-disconnect")
+        self.assertEqual(result.arg["name"], "mac")
+        self.assertFalse(client.reverse_open)
 
     def test_key_panel_flow(self):
         import sys

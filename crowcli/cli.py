@@ -122,7 +122,8 @@ def remote_record(meta):
 
 def ssh_args_for(record):
     record = host_record(record)
-    args = ["ssh", "-o", "ConnectTimeout=10"]
+    args = ["ssh", "-o", "ConnectTimeout=10",
+            "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3"]
     if record.get("port"):
         args += ["-p", str(record["port"])]
     if record.get("identity"):
@@ -419,8 +420,15 @@ def run_attach(name):
                         "name": item["name"], "kind": item["kind"],
                         "status": status,
                         "current": item["name"] == current})
+                hosts = []
+                for host in fresh.data.get("hosts", []):
+                    ssh_name = ssh_session_name(host)
+                    found = fresh.find(ssh_name)
+                    hosts.append(dict(host, ssh_session=ssh_name)
+                                 if found and found["kind"] == "ssh"
+                                 else host)
                 return {"sessions": sessions,
-                        "hosts": fresh.data.get("hosts", []),
+                        "hosts": hosts,
                         "keys": key_entries(fresh, fingerprints=False)}
 
             def delete_key(key, files):
@@ -501,6 +509,9 @@ def run_attach(name):
                 with_registry(drop)
                 reg = registry_mod.load_registry()
                 if reg.find(name) is None:
+                    if session["kind"] == "ssh" and other_session(name):
+                        name = other_session(name)
+                        continue
                     return int(code or 0) if code else 0
                 continue
             if result.action == "open-file":
@@ -526,6 +537,14 @@ def run_attach(name):
                 record = host_record(result.arg)
                 name = with_registry(
                     lambda reg: ensure_ssh_session(reg, record))
+                continue
+            if result.action == "host-disconnect":
+                closed = disconnect_host(host_record(result.arg))
+                if closed == name:
+                    name = other_session(name)
+                    if name is None:
+                        print("\n[crow-cli] %s 연결을 끊었습니다" % closed)
+                        return 0
                 continue
             if result.action == "host-check":
                 record = host_record(result.arg)
@@ -1576,15 +1595,47 @@ def cmd_host_check(args):
 # -------------------------------------------------------------- ssh 접속
 def ssh_command(record):
     base = " ".join(shlex.quote(a) for a in ssh_args_for(record))
-    # If ssh drops instantly (bad host, auth), the pane must not die:
-    # fall back to a local shell in the same pane so it can be retried.
-    return base + "; echo '[crow-cli] ssh가 종료됐습니다 — 다시 붙으려면 " \
-        "ssh 명령을 다시 실행하세요'; exec ${SHELL:-/bin/sh}"
+    # A normal logout closes the session. ssh's own failures (exit 255:
+    # broken pipe, timeout, auth) keep the pane and ask what to do next.
+    return (
+        "while :; do " + base + "; [ $? -ne 255 ] && exit 0; echo; "
+        "printf '[crow-cli] ssh 연결이 끊겼습니다 — Enter: 다시 접속 · "
+        "q: 연결 끊기 · s: 로컬 셸 '; read -r a || exit 0; "
+        "case \"$a\" in q|Q) exit 0;; s|S) exec ${SHELL:-/bin/sh};; esac; "
+        "done")
+
+
+def ssh_session_name(record):
+    return "ssh-" + derive_host_name(record.get("name") or
+                                     record["address"])
+
+
+def disconnect_host(record):
+    """Close the host's ssh session. Returns its name, or None."""
+    name = ssh_session_name(record)
+
+    def kill(reg):
+        session = reg.find(name)
+        if session is None or session["kind"] != "ssh":
+            return None
+        for win in list(session["windows"]):
+            stop_window(win)
+        reg.remove_session(name)
+        return name
+    return with_registry(kill)
+
+
+def other_session(exclude):
+    """The most recently attached session other than exclude."""
+    sessions = [s for s in registry_mod.load_registry().data["sessions"]
+                if s["name"] != exclude]
+    if not sessions:
+        return None
+    return max(sessions, key=lambda s: s.get("last_attached") or 0)["name"]
 
 
 def ensure_ssh_session(reg, record):
-    name = "ssh-" + derive_host_name(record.get("name") or
-                                      record["address"])
+    name = ssh_session_name(record)
     registry_mod.validate_name(name)
     if reg.find(name):
         return name
@@ -1595,6 +1646,15 @@ def ensure_ssh_session(reg, record):
                                "ssh_host_name": record.get("name")})
     spawn_window(win)
     return name
+
+
+def cmd_host_disconnect(args):
+    record = host_record(args.name, registry_mod.load_registry())
+    closed = disconnect_host(record)
+    if closed is None:
+        raise SystemExit("crow-cli: %s에 열린 SSH 세션이 없습니다" % args.name)
+    print("closed %s" % closed)
+    return 0
 
 
 def cmd_ssh(args):
@@ -1896,6 +1956,9 @@ def build_parser():
     hp = host_sub.add_parser("check", help="연결 + 키 인증 확인")
     hp.add_argument("name")
     hp.set_defaults(fn=cmd_host_check)
+    hp = host_sub.add_parser("disconnect", help="SSH 연결 끊기 (세션 닫기)")
+    hp.add_argument("name")
+    hp.set_defaults(fn=cmd_host_disconnect)
     hp = host_sub.add_parser("list")
     hp.set_defaults(fn=cmd_hosts)
     p.set_defaults(fn=cmd_hosts)

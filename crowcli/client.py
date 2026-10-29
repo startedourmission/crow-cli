@@ -481,7 +481,7 @@ class Client(object):
     # outer terminal stays in the alternate screen with crow's modes on
     # (toggling it per window switch is churn Terminal.app doesn't need).
     SEAMLESS = ("switch", "switch-session", "split-v", "split-h", "zoom",
-                "new", "open-file", "ssh-connect")
+                "new", "open-file", "ssh-connect", "host-disconnect")
     _term_active = False
     LEAVE = (b"\x1b[r\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l"
              b"\x1b[?2004l\x1b[?1l\x1b[?25h\x1b[?1049l")
@@ -1623,8 +1623,13 @@ class Client(object):
             state = self._host_status.get(
                 host.get("address") or host.get("name") or "", {})                 .get("state", "")
             suffix = " · " + state if state else ""
-            return [
-                {"kind": "ssh", "label": "SSH 접속 (터미널 열기)"},
+            connected = bool(host.get("ssh_session"))
+            ssh_rows = [
+                {"kind": "ssh", "label": "SSH 세션으로 이동"},
+                {"kind": "disconnect", "label": "SSH 연결 끊기 (세션 닫기)"},
+            ] if connected else [
+                {"kind": "ssh", "label": "SSH 접속 (터미널 열기)"}]
+            return ssh_rows + [
                 {"kind": "reverse-open",
                  "label": "리버스 에이전트 실행 →"},
                 {"kind": "check", "label": "키·연결 확인" + suffix},
@@ -1687,6 +1692,10 @@ class Client(object):
         elif row["kind"] == "ssh":
             self.reverse_open = False
             return AttachResult("ssh-connect", self._pending_host)
+        elif row["kind"] == "disconnect":
+            self.reverse_open = False
+            self._sidebar_at = 0.0
+            return AttachResult("host-disconnect", self._pending_host)
         elif row["kind"] == "reverse-open":
             self.reverse_stage = "provider"
             self.reverse_sel = 0
