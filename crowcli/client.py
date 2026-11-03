@@ -481,7 +481,8 @@ class Client(object):
     # outer terminal stays in the alternate screen with crow's modes on
     # (toggling it per window switch is churn Terminal.app doesn't need).
     SEAMLESS = ("switch", "switch-session", "split-v", "split-h", "zoom",
-                "new", "open-file", "ssh-connect", "host-disconnect")
+                "new", "open-file", "ssh-connect", "host-disconnect",
+                "new-session")
     _term_active = False
     LEAVE = (b"\x1b[r\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l"
              b"\x1b[?2004l\x1b[?1l\x1b[?25h\x1b[?1049l")
@@ -738,6 +739,7 @@ class Client(object):
                     tone[status_color.get(status, "37")] + ";" + bg
                 lines.append(("   ✗ " + status if failed
                               else "   ● " + status, style, action))
+        lines.append((" + 새 세션", "38;5;31;" + bg, ("new-session", None)))
         lines.append(("", plain, None))
         lines.append((" 호스트 · 리버스", heading, None))
         for host in data.get("hosts", []):
@@ -807,6 +809,9 @@ class Client(object):
         kind, arg = action
         if kind == "switch-session":
             return AttachResult("switch-session", arg)
+        if kind == "new-session":
+            self.sidebar_focus = False
+            return AttachResult("new-session", self._active_cwd())
         if kind == "reverse-host":
             self._open_reverse_for_host(arg)
         elif kind == "add-host":
@@ -1664,6 +1669,18 @@ class Client(object):
                          "provider": provider})
         return rows
 
+    def _active_cwd(self):
+        root = None
+        if self.explorer_root_provider:
+            try:
+                root = self.explorer_root_provider(self.active_id)
+            except Exception:
+                root = None
+        if not root:
+            active = self._active()
+            root = active.pane.get("cwd") if active else os.getcwd()
+        return root
+
     def _reverse_activate(self):
         rows = self._reverse_rows()
         if not rows or self.reverse_sel >= len(rows):
@@ -1708,15 +1725,7 @@ class Client(object):
         elif row["kind"] == "target":
             self._cycle_target()
         elif row["kind"] == "provider":
-            root = None
-            if self.explorer_root_provider:
-                try:
-                    root = self.explorer_root_provider(self.active_id)
-                except Exception:
-                    root = None
-            if not root:
-                active = self._active()
-                root = active.pane.get("cwd") if active else os.getcwd()
+            root = self._active_cwd()
             self.reverse_open = False
             return AttachResult("reverse-start", {
                 "local": self._pending_local, "host": self._pending_host,

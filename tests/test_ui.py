@@ -666,12 +666,41 @@ class SidebarKeyboardTests(unittest.TestCase):
         self.assertIsNone(client.form["edit"])
         client._close_host_form()
         self.press(client, b"k")  # wraps up into the session list
-        result = self.press(client, b"\r")
+        self.assertEqual(self.highlighted(client), ["+ 새 세션"])
+        result = self.press(client, b"k", b"\r")
         self.assertEqual(result.action, "switch-session")
         self.assertEqual(result.arg, "work")
         # Korean IME keys map to the same commands.
-        self.press(client, "ㅓ".encode())
+        self.press(client, "ㅓ".encode(), "ㅓ".encode())
         self.assertEqual(self.highlighted(client)[0], "● mac")
+
+    def test_new_session_item_uses_active_folder(self):
+        client = self.make_client()
+        client.explorer_root_provider = lambda _pane: "/tmp/proj"
+        self.press(client, b"\x02", b"h", b"k")
+        result = self.press(client, b"\r")
+        self.assertEqual(result.action, "new-session")
+        self.assertEqual(result.arg, "/tmp/proj")
+        self.assertFalse(client.sidebar_focus)
+
+    def test_new_local_session_named_after_folder(self):
+        from unittest import mock
+        from crowcli import cli, registry
+        with tempfile.TemporaryDirectory(prefix="cch-", dir="/tmp") as home, \
+                tempfile.TemporaryDirectory(prefix="my proj", dir="/tmp") \
+                as folder, \
+                mock.patch.object(cli, "spawn_window", lambda win: None), \
+                mock.patch.dict(os.environ, CROWCLI_HOME=home):
+            first = cli.with_registry(
+                lambda reg: cli.new_local_session(reg, folder))
+            second = cli.with_registry(
+                lambda reg: cli.new_local_session(reg, folder))
+            base = os.path.basename(folder).replace(" ", "-")
+            self.assertEqual((first, second), (base, base + "-2"))
+            session = registry.load_registry().find(second)
+            self.assertEqual(session["kind"], "local")
+            pane = registry.active_pane(session["windows"][0])
+            self.assertEqual(pane["cwd"], folder)
 
     def test_deleted_host_keeps_selection_in_range(self):
         client = self.make_client()

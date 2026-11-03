@@ -538,6 +538,10 @@ def run_attach(name):
                 name = with_registry(
                     lambda reg: ensure_ssh_session(reg, record))
                 continue
+            if result.action == "new-session":
+                name = with_registry(
+                    lambda reg: new_local_session(reg, result.arg))
+                continue
             if result.action == "host-disconnect":
                 closed = disconnect_host(host_record(result.arg))
                 if closed == name:
@@ -770,6 +774,15 @@ def find_pane(session, selector):
                 pane_selector):
             return win, pane
     return win, None
+
+
+def new_local_session(reg, cwd):
+    """A fresh local session named after its folder (crow_cli, crow_cli-2…)."""
+    cwd = cwd if cwd and os.path.isdir(cwd) else os.getcwd()
+    base = re.sub(r"[^\w.\-]+", "-", os.path.basename(cwd.rstrip("/")))
+    session = reg.create_session(free_name(reg, base.strip("-") or "session"))
+    spawn_window(reg.add_window(session, cwd=cwd))
+    return session["name"]
 
 
 def cmd_new(args):
