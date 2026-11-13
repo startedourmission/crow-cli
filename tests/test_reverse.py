@@ -107,6 +107,125 @@ class ReverseLocalTests(unittest.TestCase):
         capture = self.cli("capture", "-t", "rag").stdout
         self.assertIn("client workspace is", capture)
 
+    def wait_capture(self, target, text):
+        deadline = time.time() + 15
+        while time.time() < deadline:
+            if text in self.cli("capture", "-t", target).stdout:
+                return True
+            time.sleep(0.2)
+        return False
+
+    def test_split_and_new_window_start_another_agent(self):
+        result = self.cli("reverse-agent", "--local", "--provider", "fake",
+                          "--dir", self.ws.name, "-s", "rag", "-d")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        split = self.cli("split-window", "-t", "rag")
+        self.assertEqual(split.returncode, 0, split.stderr)
+        self.assertIn("(agent)", split.stdout)
+        self.assertTrue(self.wait_capture("rag:0.1", "client workspace is"),
+                        "split pane did not start the agent")
+        new = self.cli("new-window", "-t", "rag")
+        self.assertEqual(new.returncode, 0, new.stderr)
+        self.assertEqual(new.stdout.strip(), "rag:fake-2")
+        self.assertTrue(self.wait_capture("rag:1", "client workspace is"),
+                        "new window did not start the agent")
+        state = json.loads(
+            (Path(self.home.name) / "state.json").read_text())
+        session = state["sessions"][0]
+        panes = [p for w in session["windows"] for p in w["panes"]]
+        self.assertEqual(len(panes), 3)
+        for pane in panes:
+            self.assertEqual(pane["meta"]["provider"], "fake")
+            self.assertEqual(pane["meta"]["client_root"],
+                             os.path.realpath(self.ws.name))
+        # Each agent got its own launch, not a copy of the first one's.
+        self.assertEqual(len(set(p["command"] for p in panes)), 3)
+        refused = self.cli("split-window", "-t", "rag", "--", "vi")
+        self.assertNotEqual(refused.returncode, 0)
+
+    def test_change_folder_restarts_agent_in_new_folder(self):
+        from unittest import mock
+        from crowcli import cli, registry
+        result = self.cli("reverse-agent", "--local", "--provider", "fake",
+                          "--dir", self.ws.name, "-s", "rag", "-d")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        other = tempfile.TemporaryDirectory(prefix="ccw2-", dir="/tmp")
+        self.addCleanup(other.cleanup)
+        with mock.patch.dict(os.environ, self.env):
+            old = registry.active_pane(registry.load_registry().find("rag")
+                                       ["windows"][0])
+
+            def move(reg, root=other.name):
+                win = reg.find("rag")["windows"][0]
+                return cli.change_reverse_folder(reg, win, old["id"], root)
+            pane = cli.with_registry(move)
+            win = registry.load_registry().find("rag")["windows"][0]
+        root = os.path.realpath(other.name)
+        self.assertNotEqual(pane["id"], old["id"])
+        self.assertEqual([p["id"] for p in win["panes"]], [pane["id"]])
+        self.assertEqual(win["layout"], {"leaf": pane["id"]})
+        self.assertEqual(win["panes"][0]["meta"]["client_root"], root)
+        self.assertEqual(win["meta"]["client_root"], root)
+        target = Path(root) / "reverse-agent-was-here.txt"
+        deadline = time.time() + 15
+        while not target.exists() and time.time() < deadline:
+            time.sleep(0.1)
+        self.assertTrue(target.exists(), "new agent never reached folder")
+        self.assertTrue(self.wait_capture("rag", "client workspace is "
+                                          + root))
+        # Same folder again is a no-op; a missing folder is refused.
+        with mock.patch.dict(os.environ, self.env):
+            self.assertIsNone(cli.with_registry(
+                lambda reg: cli.change_reverse_folder(
+                    reg, reg.find("rag")["windows"][0], pane["id"], root)))
+            with self.assertRaises(ValueError):
+                cli.with_registry(lambda reg: cli.change_reverse_folder(
+                    reg, reg.find("rag")["windows"][0], pane["id"],
+                    root + "/nope"))
+
+    def test_prefix_split_while_attached_keeps_the_session(self):
+        import pty
+        import select
+        import struct
+        import termios
+        import fcntl
+        result = self.cli("reverse-agent", "--local", "--provider", "fake",
+                          "--dir", self.ws.name, "-s", "rag", "-d")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        master, slave = pty.openpty()
+        fcntl.ioctl(slave, termios.TIOCSWINSZ,
+                    struct.pack("HHHH", 24, 100, 0, 0))
+        proc = subprocess.Popen([CROW, "attach", "-t", "rag"], stdin=slave,
+                                stdout=slave, stderr=slave, env=self.env)
+        os.close(slave)
+        out = b""
+
+        def drain(wait):
+            nonlocal out
+            end = time.time() + wait
+            while time.time() < end:
+                if select.select([master], [], [], 0.05)[0]:
+                    try:
+                        out += os.read(master, 65536)
+                    except OSError:
+                        break
+        drain(2.0)
+        for data, wait in [(b"\x02%", 4.0), (b"\x02c", 4.0),
+                           (b"\x02d", 2.0)]:
+            os.write(master, data)
+            drain(wait)
+        proc.wait(timeout=10)
+        os.close(master)
+        self.assertEqual(proc.returncode, 0, out[-600:])
+        self.assertIn("리버스 에이전트(fake) 시작 중".encode(), out)
+        self.assertIn(b"detached from rag", out)
+        state = json.loads(
+            (Path(self.home.name) / "state.json").read_text())
+        windows = state["sessions"][0]["windows"]
+        self.assertEqual([len(w["panes"]) for w in windows], [2, 1])
+        self.assertIn("client workspace is",
+                      self.cli("capture", "-t", "rag:0.1").stdout)
+
 
 class ProxyReconnectTests(unittest.TestCase):
     """Reads replay across a bridge restart; the agent never reconnects."""
@@ -247,3 +366,69 @@ class RemotePathTests(unittest.TestCase):
             cli.remote_exec({"address": "u@h"}, ["cat"], stdin_data="x")
             self.assertEqual(run.call_args.kwargs["input"], "x")
 
+
+
+class RemoteForwardTests(unittest.TestCase):
+    """Remote reverse panes: one -R per bridge port, one -L per pane,
+    kept across re-attaches and closed when their pane is gone."""
+
+    def test_forwards_cover_every_pane_and_persist(self):
+        from unittest import mock
+        from crowcli import cli
+        home = tempfile.mkdtemp(prefix="cch-", dir="/tmp")
+        meta = {"client_root": "/ws", "provider": "claude",
+                "remote_host": "u@h", "bridge_remote_port": 50000,
+                "remote_socket": "/tmp/crow-cli-sessions-501/p1.sock"}
+
+        def pane(pid):
+            return {"id": pid, "name": pid, "cwd": "/", "command": None,
+                    "meta": dict(meta)}
+        win1 = {"id": "w1", "name": "claude", "meta": dict(meta),
+                "panes": [pane("p1"), pane("p2")], "active_pane": 0,
+                "layout": {"split": "v", "ratio": 0.5, "a": {"leaf": "p1"},
+                           "b": {"leaf": "p2"}}}
+        win2 = {"id": "w2", "name": "claude-2", "meta": dict(meta),
+                "panes": [pane("p3")], "active_pane": 0,
+                "layout": {"leaf": "p3"}}
+        session = {"name": "r", "kind": "reverse-agent",
+                   "windows": [win1, win2]}
+
+        class Reg(object):
+            data = {"sessions": [session]}
+        procs = []
+
+        def popen(args, **_kwargs):
+            proc = mock.Mock()
+            proc.poll.return_value = None
+            proc.args = args
+            if "-L" in args:
+                Path(args[args.index("-L") + 1].split(":")[0]).touch()
+            procs.append(proc)
+            return proc
+        forwards = {}
+        with mock.patch.dict(os.environ, {"CROWCLI_HOME": home}), \
+                mock.patch.object(cli, "ensure_bridge",
+                                  return_value={"port": 40000,
+                                                "token": "t"}), \
+                mock.patch.object(cli.subprocess, "Popen", popen):
+            cli.ensure_reverse_forwards(Reg(), session, forwards)
+            self.assertEqual(sorted(k[0] for k in forwards),
+                             ["bridge", "pane", "pane", "pane"])
+            remote = [p.args[p.args.index("-L") + 1].split(":")[1]
+                      for p in procs if "-L" in p.args]
+            self.assertEqual(sorted(remote), [
+                "/tmp/crow-cli-sessions-501/%s.sock" % i
+                for i in ("p1", "p2", "p3")])
+            self.assertEqual(win2["meta"]["session_root"],
+                             os.path.join(home, "forwards"))
+            # Re-attach: nothing restarted.
+            cli.ensure_reverse_forwards(Reg(), session, forwards)
+            self.assertEqual(len(procs), 4)
+            # p2 killed: its tunnel closes, the others stay.
+            win1["panes"] = win1["panes"][:1]
+            win1["layout"] = {"leaf": "p1"}
+            gone = forwards[("pane", "p2")]
+            cli.ensure_reverse_forwards(Reg(), session, forwards)
+            gone.terminate.assert_called_once()
+            self.assertNotIn(("pane", "p2"), forwards)
+            self.assertEqual(len(procs), 4)

@@ -40,6 +40,7 @@ HELP_KEYS = [
     (",  $", "윈도우 / 세션 이름"),
     ("e", "파일 탐색기"),
     ("a", "호스트 · 리버스"),
+    ("f  우클릭", "리버스 pane 작업 폴더 바꾸기 (새 대화)"),
     ("h", "사이드바 키보드 조작 (호스트·세션·키)"),
     ("C-b", "Ctrl-B 그대로 보내기"),
 ]
@@ -1446,6 +1447,13 @@ class Client(object):
             runtime = self._runtime(pane_id)
             if runtime is None:
                 return
+            if final == b"M" and button & ~28 == 2 and \
+                    self._reverse_root(runtime):
+                # Right-click on a reverse pane: change its folder.
+                self._focus_dirty = self._focus(pane_id) or \
+                    self._focus_dirty
+                self._open_folder_form(pane_id)
+                return
             if button in (64, 65):  # wheel
                 if runtime.screen.mouse_mode:
                     self._forward_mouse(runtime, button, gx - x, gy - y,
@@ -2155,6 +2163,8 @@ class Client(object):
 
     def _form_key(self, unit):
         form = self.form
+        if form.get("kind") == "folder":
+            return self._folder_key(unit)
         mouse = MOUSE_RE.match(unit)
         if mouse:
             if mouse.group(4) == b"M" and not int(mouse.group(1)) & 96:
@@ -2333,9 +2343,24 @@ class Client(object):
 
     def _form_chunk(self):
         form = self.form
+        cancel = ("Esc 취소", "cancel")
+        if form.get("kind") == "folder":
+            return self._popup_chunk(
+                form, "─ 리버스 작업 폴더 ",
+                "Tab 완성 · ↑↓ 고르기 · Enter 변경 · Esc 취소 ",
+                (("Enter 변경", "save"), cancel), 64, 16,
+                self._folder_lines)
+        return self._popup_chunk(
+            form, "─ 호스트 수정 " if form.get("edit") else "─ 호스트 추가 ",
+            "Tab 이동 · ←→ 키 선택 · Enter 저장 · Esc 취소 ",
+            (("Enter 저장", "save"), cancel), 60, 14, self._form_lines)
+
+    def _popup_chunk(self, form, title, hint, hint_hits, full_w, full_h,
+                     lines_fn):
+        """A centered popup box that pops in, filled by lines_fn once the
+        animation ends; the hint words in the bottom edge are clickable."""
         cols, rows = self._winsize()
-        full_w = min(60, cols - 2)
-        full_h = 14
+        full_w = min(full_w, cols - 2)
         elapsed = time.time() - form["opened"]
         t = min(1.0, max(0.0, elapsed / self.HELP_ANIM))
         grow = 1 - (1 - t) ** 3
@@ -2355,16 +2380,14 @@ class Client(object):
         def put(row, text):
             out.append("\x1b[%d;%dH" % (top + row + 1, left + 1) + text)
 
-        title = "─ 호스트 수정 " if form.get("edit") else "─ 호스트 추가 "
         put(0, box + "╭" + self._pad(title, inner, "─") + "╮")
         blank = body + " " * inner
         lines = [blank] * (height - 2)
         if t >= 1.0:
-            lines = self._form_lines(form, top, left, inner, body, dim)
+            lines = lines_fn(form, top, left, inner, body, dim)
             form["full"] = True
         for i, text in enumerate(lines[:height - 2]):
             put(i + 1, box + "│" + text + box + "│")
-        hint = "Tab 이동 · ←→ 키 선택 · Enter 저장 · Esc 취소 "
         if self._width(hint) + 2 > inner:
             hint = ""
         dashes = "─" * (inner - self._width(hint) - (1 if hint else 0))
@@ -2373,7 +2396,7 @@ class Client(object):
         form["box"] = (top + 1, left + 1, top + height, left + width)
         if hint and t >= 1.0:
             start = left + 3 + len(dashes)  # 1-based column of the hint
-            for word, name in (("Enter 저장", "save"), ("Esc 취소", "cancel")):
+            for word, name in hint_hits:
                 x0 = start + self._width(hint[:hint.index(word)])
                 form["hits"].append((top + height, x0,
                                      x0 + self._width(word), name))
@@ -2386,6 +2409,283 @@ class Client(object):
             out.append("\x1b[%d;%dH" % (top + height + 1, left + 2) + shadow
                        + " " * max(0, min(width, cols - left - 1)))
         return ("".join(out) + "\x1b[0m").encode(errors="replace")
+
+    # -- reverse folder popup -------------------------------------------------
+    FOLDER_ROWS = 6
+
+    @staticmethod
+    def _reverse_root(runtime):
+        """The client folder a reverse-agent pane works on, else None."""
+        if runtime is None:
+            return None
+        return (runtime.pane.get("meta") or {}).get("client_root")
+
+    @staticmethod
+    def _tilde(path):
+        home = os.path.expanduser("~")
+        if path == home or path.startswith(home + os.sep):
+            return "~" + path[len(home):]
+        return path
+
+    def _open_folder_form(self, pane_id):
+        """Popup that moves a reverse pane to another client folder."""
+        root = self._reverse_root(self._runtime(pane_id))
+        if not root:
+            self._flash("리버스 에이전트 pane에서만 폴더를 바꿀 수 있어요")
+            return
+        text = self._tilde(root).rstrip("/") + "/"
+        self.form = {"kind": "folder", "pane": pane_id, "current": root,
+                     "path": text, "caret": {"path": len(text)},
+                     "view": {}, "sel": -1, "scroll": 0, "error": None,
+                     "opened": time.time(), "cursor": None, "hits": []}
+        self.explorer_open = False
+        self.reverse_open = False
+        self.help_open = False
+        if self.sidebar_focus:
+            self._leave_sidebar()
+        self._focus_dirty = True
+
+    def _folder_target(self, text):
+        """Absolute path for the typed text (relative = from the current
+        folder), without resolving symlinks the user typed."""
+        return os.path.normpath(os.path.join(
+            self.form["current"], os.path.expanduser(text.strip())))
+
+    def _folder_matches(self):
+        """Sub-folders of the typed path's parent starting with its last
+        component (case-insensitive; dot-folders only when asked for)."""
+        form = self.form
+        text = form["path"]
+        head, prefix = text[:text.rfind("/") + 1], text[text.rfind("/") + 1:]
+        key = (head, prefix)
+        if form.get("match_key") == key:
+            return form["matches"]
+        base = self._folder_target(head) if head else form["current"]
+        names = []
+        try:
+            with os.scandir(base) as entries:
+                for entry in entries:
+                    if prefix and not entry.name.lower().startswith(
+                            prefix.lower()):
+                        continue
+                    if entry.name.startswith(".") and \
+                            not prefix.startswith("."):
+                        continue
+                    try:
+                        if entry.is_dir():
+                            names.append(entry.name)
+                    except OSError:
+                        continue
+        except OSError:
+            pass
+        names.sort(key=lambda n: (n.lower(), n))
+        form["match_key"], form["matches"] = key, names[:500]
+        return form["matches"]
+
+    def _folder_set(self, text):
+        form = self.form
+        form["path"] = text
+        form["caret"]["path"] = len(text)
+        form["sel"], form["scroll"], form["error"] = -1, 0, None
+
+    def _folder_pick(self, index):
+        """Descend into a listed folder (fills the path, keeps the popup)."""
+        text = self.form["path"]
+        names = self._folder_matches()
+        if 0 <= index < len(names):
+            self._folder_set(text[:text.rfind("/") + 1] + names[index] + "/")
+
+    def _folder_complete(self):
+        """Tab: one match → fill it; several → extend to their common
+        prefix, or start choosing from the list."""
+        form = self.form
+        names = self._folder_matches()
+        if not names:
+            return
+        if len(names) == 1:
+            self._folder_pick(0)
+            return
+        text = form["path"]
+        typed = text[text.rfind("/") + 1:]
+        common = os.path.commonprefix([n.lower() for n in names])
+        if len(common) > len(typed):
+            self._folder_set(text[:text.rfind("/") + 1]
+                             + names[0][:len(common)])
+        else:
+            form["sel"] = (form["sel"] + 1) % len(names)
+
+    def _folder_submit(self):
+        form = self.form
+        target = self._folder_target(form["path"])
+        if not form["path"].strip() or not os.path.isdir(target):
+            form["error"] = "폴더가 아니에요: %s" % self._tilde(target)
+            return None
+        if os.path.realpath(target) == os.path.realpath(form["current"]):
+            form["error"] = "지금 작업 폴더와 같아요"
+            return None
+        pane_id = form["pane"]
+        self._close_host_form()
+        return AttachResult("reverse-folder", (pane_id, target))
+
+    def _folder_key(self, unit):
+        form = self.form
+        mouse = MOUSE_RE.match(unit)
+        if mouse:
+            button = int(mouse.group(1))
+            if button in (64, 65):
+                names = self._folder_matches()
+                if names:
+                    step = 1 if button == 65 else -1
+                    form["sel"] = max(0, min(len(names) - 1,
+                                             form["sel"] + step))
+                return None
+            if mouse.group(4) != b"M" or button & 96:
+                return None
+            gx, gy = int(mouse.group(2)), int(mouse.group(3))
+            for row, x0, x1, target in form["hits"]:
+                if gy == row and x0 <= gx < x1:
+                    if target == "save":
+                        return self._folder_submit()
+                    if target == "cancel":
+                        self._close_host_form()
+                    elif target == "path":
+                        form["caret"]["path"] = self._form_click_caret(
+                            form, "path", gx)
+                    else:
+                        self._folder_pick(target[1])
+                    return None
+            y0, x0, y1, x1 = form.get("box") or (0, 0, 10 ** 6, 10 ** 6)
+            if not (y0 <= gy <= y1 and x0 <= gx <= x1):
+                self._close_host_form()  # click outside = cancel
+            return None
+        if unit == b"\x1b":
+            self._close_host_form()
+            return None
+        if unit in (b"\r", b"\n"):
+            if form["sel"] >= 0:
+                self._folder_pick(form["sel"])
+                return None
+            return self._folder_submit()
+        if unit == b"\t":
+            self._folder_complete()
+            return None
+        if unit in (b"\x1b[A", b"\x1b[B", b"\x1b[Z"):
+            names = self._folder_matches()
+            if names:
+                step = 1 if unit == b"\x1b[B" else -1
+                form["sel"] = max(-1, min(len(names) - 1, form["sel"] + step))
+            return None
+        value = form["path"]
+        at = min(form["caret"]["path"], len(value))
+        caret = form["caret"]
+        if unit in (b"\x1b[C", b"\x1b[D"):
+            step = 1 if unit == b"\x1b[C" else -1
+            caret["path"] = max(0, min(len(value), at + step))
+            return None
+        if unit in (b"\x1b[H", b"\x1bOH", b"\x1b[1~", b"\x01"):
+            caret["path"] = 0
+            return None
+        if unit in (b"\x1b[F", b"\x1bOF", b"\x1b[4~", b"\x05"):
+            caret["path"] = len(value)
+            return None
+        if unit in (b"\x7f", b"\x08"):
+            if at:
+                value = value[:at - 1] + value[at:]
+                at -= 1
+        elif unit in (b"\x1b[3~", b"\x04"):
+            value = value[:at] + value[at + 1:]
+        elif unit == b"\x15":  # ^U: clear before the caret
+            value, at = value[at:], 0
+        elif unit == b"\x17":  # ^W: drop the last path component
+            cut = value[:at].rstrip("/")
+            cut = cut[:cut.rfind("/") + 1]
+            value, at = cut + value[at:], len(cut)
+        elif unit.startswith(b"\x1b"):
+            return None  # bracketed-paste markers and other sequences
+        else:
+            text = unit.decode(errors="ignore").replace("\n", "")
+            if not (text and text.isprintable()):
+                return None
+            value, at = value[:at] + text + value[at:], at + len(text)
+        form["path"], caret["path"] = value, at
+        form["sel"], form["scroll"], form["error"] = -1, 0, None
+        return None
+
+    def _folder_lines(self, form, top, left, inner, body, dim):
+        """Rows of the folder popup: current folder, the path field, the
+        matching sub-folders and a note; records hits and the cursor."""
+        label_w, field_w = 9, inner - 13
+        lines = []
+
+        def plain(text, style=body):
+            lines.append(style + self._pad(text, inner))
+
+        def row():
+            return top + len(lines) + 2  # 1-based screen row of next line
+
+        plain("")
+        plain("  %s%s" % (self._pad("지금", label_w),
+                          self._tilde(form["current"])), dim)
+        # The path field (same look and caret scrolling as the host form).
+        col = left + 4 + label_w
+        form["hits"].append((row(), col + 1, col + 1 + field_w, "path"))
+        value = form["path"]
+        caret = min(form["caret"]["path"], len(value))
+        start = min(form["view"].get("path", (0, 0))[1], caret)
+        while self._width(value[start:caret]) > field_w - 2:
+            start += 1
+        form["view"]["path"] = (col + 1, start)
+        form["cursor"] = (row(), col + 1 + self._width(value[start:caret]))
+        field = "\x1b[0;48;5;238;38;5;255m"
+        lines.append(body + "  " + "\x1b[1;48;5;235;38;5;51m"
+                     + self._pad("새 폴더", label_w) + field + " "
+                     + self._pad(value[start:], field_w - 1) + body
+                     + " " * (inner - 2 - label_w - field_w))
+        plain("")
+        names = self._folder_matches()
+        visible = self.FOLDER_ROWS
+        sel = form["sel"]
+        if sel >= 0:
+            if sel < form["scroll"]:
+                form["scroll"] = sel
+            elif sel >= form["scroll"] + visible:
+                form["scroll"] = sel - visible + 1
+        form["scroll"] = max(0, min(form["scroll"],
+                                    max(0, len(names) - visible)))
+        for i in range(visible):
+            index = form["scroll"] + i
+            if index >= len(names):
+                if i == 0:
+                    plain("    (하위 폴더 없음)", dim)
+                else:
+                    plain("")
+                continue
+            more = (i == visible - 1 and index < len(names) - 1)
+            label = "… 외 %d개" % (len(names) - index) if more \
+                else names[index] + "/"
+            on = index == sel and not more
+            style = "\x1b[0;1;48;5;24;38;5;231m" if on else body
+            if not more:
+                form["hits"].append((row(), left + 4,
+                                     left + 2 + inner - 2, ("pick", index)))
+            lines.append(body + "  " + style
+                         + self._pad(("▸ " if on else "  ") + label,
+                                     inner - 4) + body + "  ")
+        plain("")
+        if form["error"]:
+            plain("  " + form["error"], "\x1b[0;48;5;235;38;5;203m")
+        else:
+            plain("  이 폴더에서 에이전트를 새 대화로 다시 시작해요", dim)
+        plain("")
+        y = row()
+        col = left + 1 + max(1, (inner - 24) // 2)  # 0-based
+        text = body + " " * (col - left - 1)
+        for name, label in (("save", "  변경  "), ("cancel", "  취소  ")):
+            form["hits"].append((y, col, col + 2 + self._width(label), name))
+            text += "\x1b[0;48;5;244;38;5;231m" + label + body + "    "
+            col += self._width(label) + 4
+        lines.append(text + " " * max(0, inner - (col - left - 1)))
+        return lines
 
     def _explorer_chunk(self):
         _x, _y, _w, area_h = self._area()
@@ -2474,6 +2774,9 @@ class Client(object):
             return None
         if key == "a":
             self._toggle_reverse()
+            return None
+        if key == "f":
+            self._open_folder_form(self.active_id)
             return None
         if key == "h":
             if self.sidebar_focus:

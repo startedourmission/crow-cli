@@ -5,6 +5,7 @@ import getpass
 import hashlib
 import json
 import os
+import posixpath
 import random
 import re
 import secrets
@@ -13,6 +14,7 @@ import signal
 import subprocess
 import sys
 import time
+import uuid
 
 from . import __version__, daemon as daemon_mod, registry as registry_mod
 from . import clipimage, reverse as reverse_mod, tools as tools_mod
@@ -267,50 +269,88 @@ def pick_session(reg):
     return choice or recent
 
 
-def ensure_reverse_forwards(session, window):
-    """For remote reverse sessions: open ssh -R (MCP bridge) and ssh -L
-    (PTY socket) for the duration of the attach. Returns processes."""
-    meta = window.get("meta", {})
-    host = meta.get("remote_host")
-    if not host:
-        if session["kind"].startswith("reverse"):
-            ensure_bridge(meta["client_root"])
-        return []
-    bridge = ensure_bridge(meta["client_root"])
-    if bridge["token"] != meta.get("token"):
-        eprint("crow-cli: bridge changed; agent tools will reconnect")
-    record = remote_record(meta)
-    procs = []
-    remote_port = meta["bridge_remote_port"]
-    tunnel = subprocess.Popen(
-        ssh_tunnel_args(record, ["-R", "127.0.0.1:%d:127.0.0.1:%d"
-                                 % (remote_port, bridge["port"])]),
-        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL)
-    procs.append(tunnel)
+def remote_socket_for(meta, pane_id):
+    """The server-side PTY socket of a remote reverse pane."""
+    return posixpath.join(posixpath.dirname(meta["remote_socket"]),
+                          pane_id + ".sock")
+
+
+def remote_exit_code(meta, pane_id):
+    """Exit code a remote pane left on the server, or None when it is
+    still running (or the server can't be asked right now)."""
+    try:
+        path = posixpath.join(posixpath.dirname(meta["remote_socket"]),
+                              pane_id + ".exit")
+        result = remote_exec(remote_record(meta), ["cat", path],
+                             check=False, timeout=10)
+        if result.returncode != 0:
+            return None
+        return int(result.stdout.strip() or "0")
+    except (KeyError, ValueError, OSError, subprocess.SubprocessError):
+        return None
+
+
+def ensure_reverse_forwards(reg, session, forwards):
+    """Keep the ssh tunnels reverse sessions need open across re-attaches:
+    one -R per remote bridge port (agents reach the client's crow_client
+    tools through it) and one -L per remote pane's PTY socket, for every
+    pane of every window, so splits, zoom and window switches reuse live
+    connections. `forwards` maps a key to its ssh process and is updated
+    in place; tunnels of panes that no longer exist are closed."""
+    live = set(pane["id"] for item in reg.data["sessions"]
+               for win in item["windows"]
+               for pane in registry_mod.window_panes(win))
+    for key in list(forwards):
+        if forwards[key].poll() is not None or \
+                (key[0] == "pane" and key[1] not in live):
+            forwards.pop(key).terminate()
+    if not session["kind"].startswith("reverse"):
+        return forwards
     forward_dir = os.path.join(registry_mod.home(), "forwards")
-    os.makedirs(forward_dir, mode=0o700, exist_ok=True)
-    pane = registry_mod.active_pane(window)
-    local_sock = os.path.join(forward_dir, pane["id"] + ".sock")
-    if os.path.exists(local_sock):
-        os.unlink(local_sock)
-    remote_sock = meta["remote_socket"]
-    forward = subprocess.Popen(
-        ssh_tunnel_args(record, ["-L", "%s:%s" % (local_sock,
-                                                  remote_sock)]),
-        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL)
-    procs.append(forward)
-    window["meta"]["session_root"] = forward_dir
+    wanted = {}
+    for window in session["windows"]:
+        for pane in registry_mod.window_panes(window):
+            meta = pane.get("meta") or window.get("meta", {})
+            if not meta.get("client_root"):
+                continue  # a plain local pane (e.g. an editor)
+            bridge = ensure_bridge(meta["client_root"])
+            if not meta.get("remote_host"):
+                continue
+            record = remote_record(meta)
+            wanted[("bridge", record["address"], meta["bridge_remote_port"],
+                    bridge["port"])] = (ssh_tunnel_args(record, [
+                        "-R", "127.0.0.1:%d:127.0.0.1:%d"
+                        % (meta["bridge_remote_port"], bridge["port"])]),
+                        None)
+            local_sock = os.path.join(forward_dir, pane["id"] + ".sock")
+            wanted[("pane", pane["id"])] = (ssh_tunnel_args(record, [
+                "-L", "%s:%s" % (local_sock,
+                                 remote_socket_for(meta, pane["id"]))]),
+                local_sock)
+            window["meta"]["session_root"] = forward_dir
+            if pane.get("meta", {}).get("remote_host"):
+                pane["meta"]["session_root"] = forward_dir
+    started = []
+    for key, (args, local_sock) in wanted.items():
+        if key in forwards:
+            continue
+        if local_sock:
+            os.makedirs(forward_dir, mode=0o700, exist_ok=True)
+            if os.path.exists(local_sock):
+                os.unlink(local_sock)
+        forwards[key] = subprocess.Popen(
+            args, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL)
+        if local_sock:
+            started.append((forwards[key], local_sock))
     deadline = time.time() + 15
-    while time.time() < deadline:
-        if os.path.exists(local_sock):
-            break
-        if forward.poll() is not None:
-            raise SystemExit("crow-cli: ssh 소켓 포워드 실패 — "
-                             "호스트 연결 상태를 확인하세요")
-        time.sleep(0.05)
-    return procs
+    for proc, local_sock in started:
+        while time.time() < deadline and not os.path.exists(local_sock):
+            if proc.poll() is not None:
+                raise SystemExit("crow-cli: ssh 소켓 포워드 실패 — "
+                                 "호스트 연결 상태를 확인하세요")
+            time.sleep(0.05)
+    return forwards
 
 
 def image_target(pane_meta, window_meta):
@@ -331,7 +371,7 @@ def image_target(pane_meta, window_meta):
 
 
 def run_attach(name):
-    forwards = []
+    forwards = {}
     remote_drops = 0
     notice = {"text": None}  # last failure, shown in the sidebar
     try:
@@ -347,9 +387,7 @@ def run_attach(name):
                 eprint("crow-cli: session %s has no windows" % name)
                 return 1
             spawn_window(window)
-            for proc in forwards:
-                proc.terminate()
-            forwards = ensure_reverse_forwards(session, window)
+            ensure_reverse_forwards(reg, session, forwards)
 
             def mark_attached(reg):
                 found = reg.find(name)
@@ -404,7 +442,8 @@ def run_attach(name):
                     if item["kind"].startswith("reverse"):
                         if meta.get("remote_host"):
                             tunnel_dead = item["name"] == current and any(
-                                proc.poll() is not None for proc in forwards)
+                                proc.poll() is not None
+                                for proc in forwards.values())
                             status = "연결 실패" if tunnel_dead else \
                                 "연결됨" if item["name"] == current \
                                 else "재접속 대기"
@@ -467,9 +506,6 @@ def run_attach(name):
                         if pane["id"] == pane_id:
                             win["active_pane"] = i
             with_registry(save_active_pane)
-            for proc in forwards:
-                proc.terminate()
-            forwards = []
             if result.action != "dead":
                 remote_drops = 0
 
@@ -480,11 +516,21 @@ def run_attach(name):
             if result.action == "dead":
                 pane_id, code = result.arg if isinstance(result.arg, tuple) \
                     else (window["id"], result.arg)
-                if code is None and window.get("meta", {}).get("remote_host"):
+                dead_pane = registry_mod.pane_by_id(window, pane_id) or {}
+                dead_meta = dead_pane.get("meta") or window.get("meta", {})
+                if code is None and dead_meta.get("remote_host"):
+                    # The agent itself may have quit (its exit marker is
+                    # on the server); then it's an ordinary pane exit.
+                    code = remote_exit_code(dead_meta, pane_id)
+                if code is None and dead_meta.get("remote_host"):
                     # Only the ssh forward dropped; the agent still runs
                     # on the server, so keep the session for re-attach.
                     remote_drops += 1
                     notice["text"] = "원격 연결 끊김: %s" % name
+                    # A half-dead tunnel can outlive the drop; reopen all.
+                    for proc in forwards.values():
+                        proc.terminate()
+                    forwards.clear()
                     if remote_drops < 3:
                         time.sleep(1)
                         continue
@@ -522,11 +568,15 @@ def run_attach(name):
                     found = reg.find(name)
                     win = registry_mod.Registry.active_window(found)
                     target = registry_mod.active_pane(win)
+                    # In a reverse session the file is on this client, so
+                    # the editor is a plain local pane, not another agent.
+                    meta = {"session_root": daemon_mod.runtime_root()} \
+                        if found["kind"].startswith("reverse") \
+                        else dict(target.get("meta", {}))
                     pane = reg.add_pane(
                         win, cwd=os.path.dirname(path),
                         command="%s %s" % (editor, shlex.quote(path)),
-                        direction="v", target_id=target["id"],
-                        meta=dict(target.get("meta", {})))
+                        direction="v", target_id=target["id"], meta=meta)
                     spawn_pane(win, pane)
                 with_registry(open_file)
                 continue
@@ -621,6 +671,59 @@ def run_attach(name):
                     detail = error.code if isinstance(error, SystemExit) \
                         else str(error)
                     notice["text"] = "리버스 시작 실패: %s" % detail
+                    eprint("crow-cli: ✗ %s" % notice["text"])
+                    try:
+                        input("[Enter를 누르면 돌아갑니다] ")
+                    except EOFError:
+                        pass
+                continue
+            if result.action == "reverse-folder":
+                pane_id, new_root = result.arg
+                Client.leave_terminal()
+                print("[crow-cli] 작업 폴더를 %s(으)로 바꿔 리버스 에이전트를 "
+                      "새 대화로 다시 시작 중…" % new_root)
+
+                def move(reg, pane_id=pane_id, new_root=new_root):
+                    found = reg.find(name)
+                    win = registry_mod.Registry.active_window(found)
+                    return change_reverse_folder(reg, win, pane_id, new_root)
+                try:
+                    with_registry(move)
+                    notice["text"] = None
+                except (SystemExit, subprocess.SubprocessError, OSError,
+                        ValueError, KeyError) as error:
+                    detail = error.code if isinstance(error, SystemExit) \
+                        else str(error)
+                    notice["text"] = "폴더 변경 실패: %s" % detail
+                    eprint("crow-cli: ✗ %s" % notice["text"])
+                    try:
+                        input("[Enter를 누르면 돌아갑니다] ")
+                    except EOFError:
+                        pass
+                continue
+            if result.action in ("split-v", "split-h", "new") and \
+                    session["kind"].startswith("reverse"):
+                direction = {"split-v": "v", "split-h": "h"}.get(
+                    result.action)
+                Client.leave_terminal()
+                print("[crow-cli] 새 %s에 리버스 에이전트(%s) 시작 중…"
+                      % ("pane" if direction else "창",
+                         window.get("meta", {}).get("provider", "?")))
+
+                def add(reg, direction=direction):
+                    found = reg.find(name)
+                    win = registry_mod.Registry.active_window(found)
+                    add_reverse_pane(reg, found, win,
+                                     registry_mod.active_pane(win),
+                                     direction)
+                try:
+                    with_registry(add)
+                    notice["text"] = None
+                except (SystemExit, subprocess.SubprocessError, OSError,
+                        ValueError, KeyError) as error:
+                    detail = error.code if isinstance(error, SystemExit) \
+                        else str(error)
+                    notice["text"] = "리버스 pane 시작 실패: %s" % detail
                     eprint("crow-cli: ✗ %s" % notice["text"])
                     try:
                         input("[Enter를 누르면 돌아갑니다] ")
@@ -728,7 +831,7 @@ def run_attach(name):
                 continue
             return 0
     finally:
-        for proc in forwards:
+        for proc in forwards.values():
             proc.terminate()
         Client.leave_terminal()
 
@@ -854,6 +957,15 @@ def cmd_new_window(args):
         if words and words[0] == "--":
             words = words[1:]
         command = " ".join(words) if words else None
+        if session["kind"].startswith("reverse"):
+            reject_reverse_extras(command, args.directory)
+            current = registry_mod.Registry.active_window(session)
+            win, _pane = add_reverse_pane(
+                reg, session, current, registry_mod.active_pane(current))
+            if args.window_name:
+                win["name"] = args.window_name
+            print("%s:%s" % (session["name"], win["name"]))
+            return
         win = reg.add_window(session, name=args.window_name,
                              cwd=os.path.abspath(args.directory)
                              if args.directory else os.getcwd(),
@@ -949,6 +1061,12 @@ def cmd_info(args):
     return 0 if cwd else 1
 
 
+def reject_reverse_extras(command, directory):
+    if command or directory:
+        raise SystemExit("crow-cli: 리버스 세션의 새 pane/창은 같은 에이전트로 "
+                         "열립니다 (명령·-c 폴더는 지정할 수 없어요)")
+
+
 def cmd_split_window(args):
     name, selector = parse_target(args.target)
     direction = "h" if args.vertical else "v"
@@ -961,6 +1079,15 @@ def cmd_split_window(args):
         words = list(args.command or [])
         if words and words[0] == "--":
             words = words[1:]
+        if session["kind"].startswith("reverse"):
+            reject_reverse_extras(words, args.directory)
+            _win, pane = add_reverse_pane(reg, session, win, target,
+                                          direction)
+            print("%s:%s.%d split %s (agent)" % (
+                session["name"], win["name"],
+                registry_mod.window_panes(win).index(pane),
+                "left/right" if direction == "v" else "top/bottom"))
+            return
         cwd = daemon_mod.info(target["id"],
                               root=pane_root(win, target)) or target["cwd"]
         if args.directory:
@@ -1708,6 +1835,133 @@ def find_reverse_session(reg, provider, client_root, host=None,
     return None
 
 
+def remote_prepare(record, request):
+    """Run agent-prepare on the server (runtime already installed)."""
+    result = subprocess.run(
+        ssh_base(record) + ["python3 ~/.crow-cli/lib/crow agent-prepare"],
+        input=json.dumps(request), capture_output=True, text=True,
+        timeout=60)
+    if result.returncode != 0:
+        raise SystemExit("crow-cli: remote prepare failed: %s"
+                         % result.stderr.strip())
+    return json.loads(result.stdout.strip().splitlines()[-1])
+
+
+def remote_start(record, pane_id, cwd, command):
+    """Start a pane's agent PTY on the server."""
+    try:
+        remote_exec(record, ["~/.crow-cli/bin/crow-session", "attach",
+                             pane_id, cwd, command], timeout=30)
+    except subprocess.CalledProcessError as error:
+        detail = (error.stderr or "").strip().splitlines()
+        raise SystemExit("서버에서 에이전트 세션 시작 실패%s"
+                         % ((": " + detail[-1][:160]) if detail else ""))
+
+
+def start_reverse_pane(window, pane, client_id):
+    """Run another instance of a reverse session's agent in `pane`, whose
+    meta names the provider, host and client folder: a fresh launch is
+    prepared on the server (or the local sandbox) and started in the
+    pane's PTY. Fills in the pane's cwd/command/meta."""
+    meta = pane["meta"]
+    bridge = ensure_bridge(meta["client_root"])
+    request = {"provider": meta["provider"], "client_id": client_id,
+               "client_root": meta["client_root"],
+               "bridge_host": "127.0.0.1", "token": bridge["token"]}
+    if meta.get("remote_host"):
+        record = remote_record(meta)
+        request.update(bridge_port=meta["bridge_remote_port"],
+                       python="python3",
+                       runtime_path="$HOME/.crow-cli/lib/crow")
+        prepared = remote_prepare(record, request)
+        remote_start(record, pane["id"], prepared["directory"],
+                     prepared["command"])
+        meta["remote_socket"] = remote_socket_for(meta, pane["id"])
+    else:
+        request.update(bridge_port=bridge["port"], python=sys.executable,
+                       runtime_path=ENTRY, server_home=meta["server_home"])
+        prepared = reverse_mod.prepare(request)
+        pane["command"] = prepared["command"]
+    pane["cwd"] = prepared["directory"]
+    meta["token"] = bridge["token"]
+    meta["server_directory"] = prepared["directory"]
+    if not meta.get("remote_host"):
+        spawn_pane(window, pane)
+
+
+def add_reverse_pane(reg, session, window, target, direction=None):
+    """A new pane next to `target` (direction "v"/"h") or a new window
+    (direction None) in a reverse session, running a fresh instance of
+    the same agent on the same host and client folder. Raising leaves
+    the registry unsaved, so a failed start adds nothing."""
+    meta = dict(target.get("meta") or window.get("meta", {}))
+    if meta.get("remote_host"):
+        meta.pop("session_root", None)  # set in memory per attach
+    if not meta.get("client_root") or not meta.get("provider"):
+        raise ValueError("이 pane은 리버스 에이전트가 아닙니다")
+    if direction:
+        pane = reg.add_pane(window, cwd=target["cwd"], direction=direction,
+                            target_id=target["id"], meta=meta)
+    else:
+        names = set(w["name"] for w in session["windows"])
+        base, n = meta["provider"], 1
+        win_name = base
+        while win_name in names:
+            n += 1
+            win_name = "%s-%d" % (base, n)
+        window = reg.add_window(session, name=win_name, cwd=target["cwd"],
+                                meta=meta)
+        pane = registry_mod.active_pane(window)
+    start_reverse_pane(window, pane, reg.data["client_id"])
+    return window, pane
+
+
+def change_reverse_folder(reg, window, pane_id, client_root):
+    """Point a reverse pane at another client folder. The folder is baked
+    into the agent's instructions and its server-side storage, so the old
+    agent is replaced by a fresh one (new conversation) in the same
+    layout slot. The pane gets a new id, so the new PTY starts before the
+    old one stops and a failed start leaves the old agent running. Returns the pane, or None if the folder
+    is unchanged. Raising leaves the registry unsaved."""
+    client_root = tools_mod.canonical(client_root)
+    if not os.path.isdir(client_root):
+        raise ValueError("폴더가 없습니다: %s" % client_root)
+    pane = registry_mod.pane_by_id(window, pane_id)
+    if pane is None:
+        raise ValueError("pane을 찾을 수 없습니다")
+    meta = dict(pane.get("meta") or window.get("meta", {}))
+    if not meta.get("client_root") or not meta.get("provider"):
+        raise ValueError("이 pane은 리버스 에이전트가 아닙니다")
+    if meta["client_root"] == client_root:
+        return None
+    old = dict(pane)
+    meta["client_root"] = client_root
+    if meta.get("remote_host"):
+        meta.pop("session_root", None)  # set in memory per attach
+        # The session's -R port is bound to the old folder's bridge.
+        meta["bridge_remote_port"] = random.randint(49152, 65000)
+    new_id = str(uuid.uuid4())
+
+    def relabel(tree):
+        if not tree:
+            return tree
+        if "leaf" in tree:
+            return registry_mod.leaf(new_id) if tree["leaf"] == pane_id \
+                else tree
+        return dict(tree, a=relabel(tree.get("a")), b=relabel(tree.get("b")))
+    window["layout"] = relabel(window.get("layout"))
+    if window.get("zoomed") == pane_id:
+        window["zoomed"] = new_id
+    pane.update(id=new_id, meta=meta, exited=None, created_at=time.time())
+    if len(window["panes"]) == 1:
+        for key in ("client_root", "bridge_remote_port"):
+            if key in meta:
+                window.setdefault("meta", {})[key] = meta[key]
+    start_reverse_pane(window, pane, reg.data["client_id"])
+    stop_pane(window, old)  # only once the new agent is up
+    return pane
+
+
 def launch_reverse_agent(provider, client_root, name=None, host_ref=None,
                          local=False):
     """Create (but do not attach) a reverse-agent session. Shared by the
@@ -1779,15 +2033,7 @@ def launch_reverse_agent(provider, client_root, name=None, host_ref=None,
             time.sleep(1.0)
             if tunnel.poll() is not None:
                 raise SystemExit("crow-cli: ssh -R tunnel failed")
-            result = subprocess.run(
-                ssh_base(host) + ["python3 ~/.crow-cli/lib/crow "
-                                  "agent-prepare"],
-                input=json.dumps(request), capture_output=True, text=True,
-                timeout=60)
-            if result.returncode != 0:
-                raise SystemExit("crow-cli: remote prepare failed: %s"
-                                 % result.stderr.strip())
-            prepared = json.loads(result.stdout.strip().splitlines()[-1])
+            prepared = remote_prepare(host, request)
         finally:
             tunnel.terminate()
         uid = remote_exec(host, ["id", "-u"]).stdout.strip()
@@ -1813,15 +2059,7 @@ def launch_reverse_agent(provider, client_root, name=None, host_ref=None,
         pane = registry_mod.active_pane(win)
         if meta.get("remote_host"):
             win["meta"]["remote_socket"] = meta["remote_socket"] % pane["id"]
-            try:
-                remote_exec(remote_record(meta),
-                            ["~/.crow-cli/bin/crow-session", "attach",
-                             pane["id"], cwd, command], timeout=30)
-            except subprocess.CalledProcessError as error:
-                detail = (error.stderr or "").strip().splitlines()
-                raise SystemExit(
-                    "서버에서 에이전트 세션 시작 실패%s"
-                    % ((": " + detail[-1][:160]) if detail else ""))
+            remote_start(remote_record(meta), pane["id"], cwd, command)
         else:
             pane["command"] = command
             spawn_window(win)

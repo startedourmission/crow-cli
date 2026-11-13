@@ -717,6 +717,102 @@ class SidebarKeyboardTests(unittest.TestCase):
         self.assertFalse(client.sidebar_focus)
 
 
+class ReverseFolderTests(unittest.TestCase):
+    """C-b f / right-click on a reverse pane opens a folder popup that
+    asks attach to restart the agent elsewhere."""
+
+    def setUp(self):
+        from crowcli.client import Client, PaneRuntime
+        self.ws = tempfile.TemporaryDirectory(prefix="ccw-", dir="/tmp")
+        self.addCleanup(self.ws.cleanup)
+        self.root = os.path.realpath(self.ws.name)
+        for name in ("alpha", "alps", "beta", ".hidden"):
+            Path(self.root, name).mkdir()
+        Path(self.root, "alpha", "deep").mkdir()
+        Path(self.root, "file.txt").write_text("x")
+        self.client = Client(object())
+        self.client._winsize = lambda: (100, 30)
+        agent = PaneRuntime({"id": "r", "name": "pane0", "cwd": "/tmp",
+                             "meta": {"client_root": self.root,
+                                      "provider": "claude"}}, {"meta": {}})
+        plain = PaneRuntime({"id": "s", "name": "pane1", "cwd": "/tmp",
+                             "meta": {}}, {"meta": {}})
+        self.client.runtimes = [agent, plain]
+        self.client.active_id = "r"
+
+    def type(self, *units):
+        result = None
+        for unit in units:
+            result = self.client._input(unit, {})
+        return result
+
+    def screen_text(self):
+        from crowcli.vt import Screen
+        self.client.form["opened"] = 0
+        screen = Screen(100, 30)
+        screen.feed(self.client._form_chunk())
+        return "\n".join("".join(c[0] for c in row) for row in screen.grid)
+
+    def test_prefix_f_lists_subfolders_and_restarts_in_picked_one(self):
+        self.type(b"\x02", b"f")
+        form = self.client.form
+        self.assertEqual(form["kind"], "folder")
+        text = self.screen_text()
+        self.assertIn("리버스 작업 폴더", text)
+        self.assertIn("alpha/", text)
+        self.assertIn("beta/", text)
+        self.assertNotIn(".hidden", text)
+        self.assertNotIn("file.txt", text)
+        self.type(b"a", b"l", b"\t")  # alpha, alps → common "alp"
+        self.assertTrue(form["path"].endswith("/alp"))
+        self.type(b"h", b"\t")  # unique → descend
+        self.assertTrue(form["path"].endswith("/alpha/"))
+        self.assertIn("deep/", self.screen_text())
+        result = self.type(b"\r")
+        self.assertEqual(result.action, "reverse-folder")
+        self.assertEqual(result.arg,
+                         ("r", os.path.join(self.root, "alpha")))
+        self.assertIsNone(self.client.form)
+
+    def test_arrows_pick_and_errors_keep_popup(self):
+        self.type(b"\x02", b"f")
+        self.assertIsNone(self.type(b"\r"))  # same folder
+        self.assertIn("같아요", self.client.form["error"])
+        self.type(b"\x1b[B", b"\x1b[B", b"\r")  # 2nd entry: alps
+        self.assertTrue(self.client.form["path"].endswith("/alps/"))
+        self.type(b"\x17", b"n", b"o", b"p", b"e")  # ^W drops "alps/"
+        self.assertTrue(self.client.form["path"].endswith(
+            os.path.basename(self.root) + "/nope"))
+        self.assertIsNone(self.type(b"\r"))
+        self.assertIn("폴더가 아니에요", self.client.form["error"])
+        self.client._input(b"\x1b", {}, flush_esc=True)
+        self.assertIsNone(self.client.form)
+
+    def test_relative_path_is_from_current_folder(self):
+        self.type(b"\x02", b"f", b"\x15")  # ^U clears the prefilled path
+        result = self.type(b"b", b"e", b"t", b"a", b"\r")
+        self.assertEqual(result.arg, ("r", os.path.join(self.root, "beta")))
+
+    def test_right_click_opens_only_on_reverse_panes(self):
+        x = self.client._area()[0]
+        rects = {"r": (x, 0, 30, 20), "s": (x + 31, 0, 30, 20)}
+        right = ("\x1b[<2;%d;5M" % (x + 40)).encode()
+        self.client._input(right, rects)  # plain pane
+        self.assertIsNone(self.client.form)
+        self.client.active_id = "s"
+        self.client._input(("\x1b[<2;%d;5M" % (x + 5)).encode(), rects)
+        self.assertEqual(self.client.active_id, "r")
+        self.assertEqual(self.client.form["pane"], "r")
+        self.client._input(("\x1b[<2;%d;5m" % (x + 5)).encode(), rects)
+        self.assertIsNotNone(self.client.form)
+
+    def test_prefix_f_on_plain_pane_only_flashes(self):
+        self.client.active_id = "s"
+        self.type(b"\x02", b"f")
+        self.assertIsNone(self.client.form)
+        self.assertIn("리버스", self.client._paste_msg[0])
+
+
 class ImagePasteTests(unittest.TestCase):
     def test_ctrl_v_uploads_clipboard_image_for_remote_panes(self):
         from unittest import mock
