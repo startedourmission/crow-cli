@@ -164,6 +164,11 @@ class Screen(object):
             else:
                 self.cx = x
 
+    def is_blank(self):
+        """Nothing visible on the live screen (spaces only)."""
+        return all(cell[0] in (" ", "") for line in self.grid
+                   for cell in line)
+
     def mark_clean(self):
         self.dirty = set()
 

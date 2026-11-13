@@ -32,15 +32,16 @@ HELP_KEYS = [
     ('"', "위아래로 분할"),
     ("←↑↓→ o", "pane 이동 (방향키는 0.5초 안에 연타 가능)"),
     ("z", "pane 확대 / 복원"),
+    ("{  }", "pane 자리 바꾸기 (앞 / 뒤 pane과)"),
     ("x", "pane 닫기"),
     ("c", "새 윈도우"),
     ("n  p", "다음 / 이전 윈도우"),
     ("0-9", "윈도우 선택"),
-    ("s", "세션 선택"),
+    ("s", "세션 선택 (목록 팝업)"),
     (",  $", "윈도우 / 세션 이름"),
     ("e", "파일 탐색기"),
     ("a", "호스트 · 리버스"),
-    ("f  우클릭", "리버스 pane 작업 폴더 바꾸기 (새 대화)"),
+    ("f", "리버스 pane 작업 폴더 바꾸기 (새 대화)"),
     ("h", "사이드바 키보드 조작 (호스트·세션·키)"),
     ("C-b", "Ctrl-B 그대로 보내기"),
 ]
@@ -67,6 +68,41 @@ class AttachResult(object):
 
 
 DIVIDER = 2  # cells between split panes (one edge line per pane)
+
+
+def split_dividers(tree, x, y, w, h):
+    """The divider strip of every split, mirroring compute_rects:
+    [(node, split, (x, y, w, h) of the strip, origin, span)] (0-based).
+    Dragging a strip sets that node's ratio."""
+    if not tree or "leaf" in tree or w <= 0 or h <= 0:
+        return []
+    gap = DIVIDER
+    ratio = tree.get("ratio", 0.5)
+    if tree["split"] == "v":
+        if w <= gap + 1:
+            return []
+        first = max(1, int((w - gap) * ratio))
+        return ([(tree, "v", (x + first, y, gap, h), x, w)]
+                + split_dividers(tree["a"], x, y, first, h)
+                + split_dividers(tree["b"], x + first + gap, y,
+                                 max(1, w - first - gap), h))
+    if h <= gap + 1:
+        return []
+    first = max(1, int((h - gap) * ratio))
+    return ([(tree, "h", (x, y + first, w, gap), y, h)]
+            + split_dividers(tree["a"], x, y, w, first)
+            + split_dividers(tree["b"], x, y + first + gap, w,
+                             max(1, h - first - gap)))
+
+
+def drag_ratio(position, origin, span, minimum=2):
+    """Ratio that puts a split's divider at `position` (0-based cell),
+    keeping at least `minimum` cells on either side."""
+    room = span - DIVIDER
+    if room <= 2 * minimum:
+        return 0.5
+    first = max(minimum, min(room - minimum, position - origin))
+    return round(float(first) / room, 4)
 
 
 def compute_rects(tree, panes_by_id, x, y, w, h, zoomed=None):
@@ -241,8 +277,10 @@ class Client(object):
                  explorer_root_provider=None, reverse_data_provider=None,
                  sidebar_data_provider=None, notice_provider=None,
                  windows_provider=None, host_form=None, image_target=None,
-                 key_actions=None):
+                 key_actions=None, layout_saver=None):
         self.hooks = hooks
+        # (window_id, layout tree) -> None: persists a dragged divider
+        self.layout_saver = layout_saver
         # {"list": () -> [key dict], "copy": key -> message,
         #  "delete": (key, delete_files) -> message}
         self.key_actions = key_actions or {}
@@ -483,7 +521,8 @@ class Client(object):
     # (toggling it per window switch is churn Terminal.app doesn't need).
     SEAMLESS = ("switch", "switch-session", "split-v", "split-h", "zoom",
                 "new", "open-file", "ssh-connect", "host-disconnect",
-                "new-session")
+                "new-session", "rename-window", "rename-session",
+                "kill-pane", "kill-session", "kill-window")
     _term_active = False
     LEAVE = (b"\x1b[r\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l"
              b"\x1b[?2004l\x1b[?1l\x1b[?25h\x1b[?1049l")
@@ -729,7 +768,8 @@ class Client(object):
         for session in data.get("sessions", []):
             marker = "▸" if session.get("current") else " "
             label = "%s %s" % (marker, session["name"])
-            action = None if session.get("current") else \
+            action = ("current-session", session["name"]) \
+                if session.get("current") else \
                 ("switch-session", session["name"])
             lines.append((label, "1;38;5;16;" + bg if session.get("current")
                            else plain, action))
@@ -805,6 +845,25 @@ class Client(object):
             if row == gy - 1:
                 return self._sidebar_activate(action)
         return None
+
+    def _sidebar_menu(self, gx, gy):
+        """Right-click in the sidebar: session menu, or a host's menu."""
+        for row, action in self._sidebar_rows:
+            if row != gy - 1:
+                continue
+            kind, arg = action
+            if kind in ("switch-session", "current-session"):
+                self._session_menu(arg, kind == "current-session", gx, gy)
+            elif kind == "reverse-host":
+                self._open_reverse_for_host(arg)
+            return
+
+    def _sidebar_row_of(self, action):
+        key = self._action_key(action)
+        for row, item in self._sidebar_rows:
+            if self._action_key(item) == key:
+                return row + 1
+        return 1
 
     def _sidebar_activate(self, action):
         kind, arg = action
@@ -882,6 +941,14 @@ class Client(object):
         action = items[min(self._sidebar_sel, len(items) - 1)]
         if key in ("\r", "\n", "l", " ") or final == b"C":
             return self._sidebar_activate(action)
+        if action[0] in ("switch-session", "current-session"):
+            self._menu_at = (3, self._sidebar_row_of(action))
+            if key in ("d", "x"):
+                self._confirm_kill_session(action[1])
+                return None
+            if key in ("e", "r"):
+                self._rename_session_prompt(action[1])
+                return None
         if key == "a":
             self._open_host_form()
         elif action[0] == "reverse-host" and key == "e":
@@ -1003,6 +1070,8 @@ class Client(object):
             chunks.append(self._help_chunk())
         if self.form is not None:
             chunks.append(self._form_chunk())
+        if self.menu is not None:
+            chunks.append(self._menu_chunk())
         chunks.append(self._cursor_chunk(rects))
         out.write(b"".join(chunks))
         out.flush()
@@ -1024,6 +1093,12 @@ class Client(object):
         left, right = self._bar_text(width)
         if self._width(left) > cols - files_w:
             left = self._pad(left, max(0, cols - files_w))
+        tabs = self._window_tabs()
+        tabs_w = sum(self._width(label) for label, _ in tabs) + \
+            (3 if self.windows_provider else 0) + 1
+        if files_w + self._width(left) + tabs_w + self._width(right) > cols:
+            # Window tabs matter more than the key hints.
+            right = " %s " % time.strftime("%H:%M")
         left_w, right_w = self._width(left), self._width(right)
         # Session block (own shade) | tabs flush left after a gap | hints
         # flush right.
@@ -1036,7 +1111,7 @@ class Client(object):
             body.append(b" ")
             col += 1
         hi = cols - right_w if col + right_w <= cols else cols
-        for index, (label, current) in enumerate(self._window_tabs()):
+        for index, (label, current) in enumerate(tabs):
             label_w = self._width(label)
             if col + label_w > hi:
                 break
@@ -1044,10 +1119,20 @@ class Client(object):
             body.append(label.encode(errors="replace"))
             buttons.append((col + 1, col + 1 + label_w, ("window", index)))
             col += label_w
+        if self.windows_provider and col + 3 <= hi:  # new window
+            body.append(self.TAB_STYLE + b" + ")
+            buttons.append((col + 1, col + 4, "new-window"))
+            col += 3
         body.append(self.BAR_STYLE)
         if col + right_w <= cols:
             body.append(b" " * (cols - col - right_w)
                         + right.encode(errors="replace"))
+            start = cols - right_w + 1  # 1-based column of the hints
+            for word, action in (("C-b d detach", "detach"),
+                                 ("C-b ? help", "help")):
+                if word in right:
+                    x0 = start + self._width(right[:right.index(word)])
+                    buttons.append((x0, x0 + self._width(word), action))
         else:
             body.append(b" " * max(0, cols - col))
         self._bar_buttons = buttons
@@ -1084,7 +1169,8 @@ class Client(object):
         if rect and screen.cursor_visible and active.view_offset == 0 \
                 and not ((self.explorer_open and self.explorer_focus)
                         or self.reverse_open or self.help_open
-                        or self.sidebar_focus or self.form is not None):
+                        or self.sidebar_focus or self.form is not None
+                        or self.menu is not None):
             chunks.append(b"\x1b[?25h")
         else:
             chunks.append(b"\x1b[?25l")
@@ -1143,8 +1229,48 @@ class Client(object):
         return b"".join(out)
 
     # -- main loop ---------------------------------------------------------------
+    # A pane still blank this long after attach gets its PTY shrunk by a
+    # row and restored: a real size change makes the app repaint. A
+    # same-size SIGWINCH is not enough (Node TUIs like claude ignore it)
+    # and a replay cut mid-stream can leave nothing drawn.
+    NUDGE_DELAY = 0.6
+    NUDGE_HOLD = 0.15
+
+    def _nudge_tick(self, rects, now):
+        """Called every loop turn; runs the blank-pane nudge once."""
+        if self._nudge_at is not None and now >= self._nudge_at:
+            self._nudge_at = None
+            for runtime in self.runtimes:
+                rect = rects.get(runtime.id)
+                if not rect or rect[3] < 3 or runtime.conn is None or \
+                        not runtime.screen.is_blank():
+                    continue
+                try:
+                    runtime.conn.send_size(rect[2], rect[3] - 1)
+                except socket.error:
+                    continue
+                self._nudged.append(runtime)
+            if self._nudged:
+                self._unnudge_at = now + self.NUDGE_HOLD
+        if self._unnudge_at is not None and now >= self._unnudge_at:
+            self._unnudge_at = None
+            for runtime in self._nudged:
+                rect = rects.get(runtime.id)
+                if rect:
+                    try:
+                        runtime.conn.send_size(rect[2], rect[3])
+                    except socket.error:
+                        pass
+            self._nudged = []
+
+    _nudge_at = None
+    _unnudge_at = None
+
     def _loop(self, out, stdin_fd):
         rects = self._rects()
+        self._nudge_at = time.time() + self.NUDGE_DELAY
+        self._unnudge_at = None
+        self._nudged = []
         self._render(out, rects, force=True)
         sockets = dict((r.conn.sock, r) for r in self.runtimes)
         if self._early_input:
@@ -1164,6 +1290,7 @@ class Client(object):
                 self._render(out, rects, force=True)
             if self._help_animating() or self._form_animating():
                 paint_due = True
+            self._nudge_tick(rects, time.time())
             if self._paste_queue:
                 self._flush_pastes()
             watch = list(sockets) + [stdin_fd]
@@ -1303,6 +1430,13 @@ class Client(object):
         if self.form is not None:
             self._focus_dirty = True
             return self._form_key(unit)
+        if self.menu is not None:
+            return self._menu_key(unit)
+        if self._swap_from is not None and not MOUSE_RE.match(unit):
+            self._end_swap()
+            self._focus_dirty = True
+            if unit == b"\x1b":
+                return None
         if self.help_open and not self._prefix_pending:
             mouse = MOUSE_RE.match(unit)
             if mouse and (mouse.group(4) == b"m"
@@ -1399,12 +1533,109 @@ class Client(object):
                 except socket.error:
                     pass
 
+    _drag = None  # (node, split, strip, origin, span) while resizing
+    _swap_from = None  # pane waiting for the click that picks its partner
+
+    def _start_swap(self, pane_id):
+        self._swap_from = pane_id
+        self._flash("자리를 바꿀 pane을 클릭하세요 · Esc 취소", seconds=30)
+        self._focus_dirty = True
+
+    def _end_swap(self):
+        self._swap_from = None
+        self._paste_msg = None
+        self._probe_dirty = True
+
+    def _swap_panes(self, a, b):
+        """Exchange two panes' places in the layout (sizes stay with the
+        places) and persist it."""
+        if a == b or self._window is None:
+            return False
+
+        def walk(tree):
+            if not tree:
+                return
+            if "leaf" in tree:
+                if tree["leaf"] == a:
+                    tree["leaf"] = b
+                elif tree["leaf"] == b:
+                    tree["leaf"] = a
+                return
+            walk(tree.get("a"))
+            walk(tree.get("b"))
+        walk(self._window.get("layout"))
+        self._focus_dirty = True
+        if self.layout_saver:
+            try:
+                self.layout_saver(self._window["id"],
+                                  self._window.get("layout"))
+            except Exception:
+                pass
+        return True
+
+    def _swap_step(self, step):
+        """C-b { / }: swap the active pane with the previous / next one."""
+        if self._window is None or self._window.get("zoomed"):
+            return
+        order = registry_mod.layout_pane_ids(self._window.get("layout"))
+        if len(order) < 2 or self.active_id not in order:
+            return
+        other = order[(order.index(self.active_id) + step) % len(order)]
+        self._swap_panes(self.active_id, other)
+
+    def _divider_at(self, gx, gy):
+        if self._window is None or self._window.get("zoomed"):
+            return None
+        col, row = gx - 1, gy - 1
+        for found in split_dividers(self._window.get("layout"),
+                                    *self._area()):
+            x, y, w, h = found[2]
+            if x <= col < x + w and y <= row < y + h:
+                return found
+        return None
+
+    def _drag_divider(self, button, gx, gy, final):
+        node, split, _strip, origin, span = self._drag
+        if final == b"m" or not button & 32:  # released (or a new press)
+            self._drag = None
+            if self.layout_saver and self._window is not None:
+                try:
+                    self.layout_saver(self._window["id"],
+                                      self._window.get("layout"))
+                except Exception:
+                    pass
+            return
+        ratio = drag_ratio((gx if split == "v" else gy) - 1, origin, span)
+        if ratio != node.get("ratio"):
+            node["ratio"] = ratio
+            self._focus_dirty = True  # loop re-lays out and resizes PTYs
+
     def _mouse(self, unit, match, rects):
         button, gx, gy = int(match.group(1)), int(match.group(2)), \
             int(match.group(3))
         final = match.group(4)
+        if self._drag is not None:
+            self._drag_divider(button, gx, gy, final)
+            return
+        if self._swap_from is not None:
+            if final != b"M" or button & 96:
+                return  # releases, drags and the wheel
+            source = self._swap_from
+            self._end_swap()
+            for pane_id, (x, y, w, h) in rects.items():
+                if x < gx <= x + w and y < gy <= y + h:
+                    if self._swap_panes(source, pane_id):
+                        self._focus(source)  # focus stays on the mover
+                    break
+            self._focus_dirty = True
+            return
         _, rows = self._winsize()
         if gy >= rows:  # status bar
+            if final == b"M" and button & ~24 == 2:
+                for x0, x1, action in self._bar_buttons:
+                    if x0 <= gx < x1 and action[0] == "window":
+                        self._window_menu(action[1], gx, gy)
+                return
             if final == b"M":
                 for x0, x1, action in self._bar_buttons:
                     if not x0 <= gx < x1:
@@ -1413,6 +1644,15 @@ class Client(object):
                         self._toggle_explorer()
                     elif action == "sidebar":
                         self._toggle_sidebar()
+                    elif action == "new-window":
+                        self._explorer_result = AttachResult("new")
+                    elif action == "detach":
+                        self._explorer_result = AttachResult("detach")
+                    elif action == "help":
+                        self.help_open = True
+                        self._help_opened_at = time.time()
+                        self._help_full = False
+                        self._focus_dirty = True
                     elif action[0] == "window":
                         self._explorer_result = AttachResult(
                             "switch", ("index", action[1]))
@@ -1425,6 +1665,10 @@ class Client(object):
             self._explorer_click(button, gx, gy, final)
             return
         if gx <= pane_x:
+            if final == b"M" and button & ~24 == 2:
+                self._sidebar_menu(gx, gy)
+                self._focus_dirty = True
+                return
             if final == b"M" and button not in (64, 65):
                 result = self._sidebar_click(gy)
                 if result is not None:
@@ -1441,19 +1685,36 @@ class Client(object):
             self._focus_dirty = True
         if self.sidebar_focus and final == b"M" and button not in (64, 65):
             self._leave_sidebar()
+        if final == b"M" and button == 0:
+            divider = self._divider_at(gx, gy)
+            if divider is not None:  # grab a split border to resize
+                self._drag = divider
+                return
         for pane_id, (x, y, w, h) in rects.items():
             if not (x < gx <= x + w and y < gy <= y + h):
                 continue
             runtime = self._runtime(pane_id)
             if runtime is None:
                 return
-            if final == b"M" and button & ~28 == 2 and \
-                    self._reverse_root(runtime):
-                # Right-click on a reverse pane: change its folder.
-                self._focus_dirty = self._focus(pane_id) or \
-                    self._focus_dirty
-                self._open_folder_form(pane_id)
+            if final == b"M" and button & ~24 == 2:
+                # Right-click: the pane menu (Shift+right-click still
+                # reaches an app that uses the mouse).
+                self._focus(pane_id)
+                self._focus_dirty = True
+                self._pane_menu(pane_id, gx, gy)
                 return
+            if final == b"M" and button == 0 and \
+                    not runtime.screen.mouse_mode:
+                choice = self._prompt_choice(runtime, gx - x - 1, gy - y - 1)
+                if choice is not None:  # a clickable crow prompt option
+                    self._focus(pane_id)
+                    self._focus_dirty = True
+                    runtime.view_offset = 0
+                    try:
+                        runtime.conn.send("D", choice)
+                    except (socket.error, AttributeError):
+                        pass
+                    return
             if button in (64, 65):  # wheel
                 if runtime.screen.mouse_mode:
                     self._forward_mouse(runtime, button, gx - x, gy - y,
@@ -1475,6 +1736,41 @@ class Client(object):
             if runtime.screen.mouse_mode:
                 self._forward_mouse(runtime, button, gx - x, gy - y, final)
             return
+
+    # Prompts crow itself prints inside a pane, with clickable options:
+    # (marker on the clicked row or the one above, [(label, input)]).
+    CLICK_PROMPTS = (
+        ("[crow-cli] ssh 연결이 끊겼습니다",
+         (("Enter: 다시 접속", b"\r"), ("q: 연결 끊기", b"q\r"),
+          ("s: 로컬 셸", b"s\r"))),
+    )
+
+    def _prompt_choice(self, runtime, col, row):
+        """Input for a crow prompt option at a pane cell (0-based)."""
+        lines = runtime.screen.lines_for_view(runtime.view_offset)
+
+        def text_of(index):
+            chars, cols = [], []
+            for x, cell in enumerate(lines[index]):
+                if cell[0]:  # "" = right half of a wide character
+                    chars.append(cell[0])
+                    cols.append(x)
+            return "".join(chars), cols
+        if not 0 <= row < len(lines):
+            return None
+        text, cols = text_of(row)
+        near = text + (text_of(row - 1)[0] if row else "")
+        for marker, options in self.CLICK_PROMPTS:
+            if marker not in near:
+                continue
+            for label, data in options:
+                at = text.find(label)
+                if at < 0:
+                    continue
+                last = at + len(label) - 1
+                if cols[at] <= col < cols[last] + char_width(text[last]):
+                    return data
+        return None
 
     def _forward_mouse(self, runtime, button, lx, ly, final):
         try:
@@ -1754,16 +2050,7 @@ class Client(object):
             return None
         key = latin_key(unit.decode(errors="ignore"))
         if key in ("q", "\x1b"):
-            if self.reverse_stage in self.KEY_STAGES:
-                self._key_back()
-            elif self.reverse_stage == "host-delete":
-                self.reverse_stage = "menu"
-                self.reverse_sel = 0
-            elif self.reverse_stage == "provider" and self._pending_host:
-                self.reverse_stage = "menu"  # back to the host menu
-                self.reverse_sel = 0
-            else:
-                self.reverse_open = False
+            self._reverse_back()
         elif key == "\t":
             if self.reverse_stage not in self.KEY_STAGES:
                 self._cycle_target()
@@ -1777,6 +2064,28 @@ class Client(object):
             self.reverse_sel = max(0, self.reverse_sel - 1)
         self._focus_dirty = True
         return None
+
+    _reverse_back_hit = (0, 0)
+
+    def _reverse_can_go_back(self):
+        stage = self.reverse_stage
+        return stage in ("key", "key-host", "key-delete", "host-delete") \
+            or (stage == "provider" and bool(self._pending_host))
+
+    def _reverse_back_label(self):
+        return " ‹ 뒤로 " if self._reverse_can_go_back() else " ✕ 닫기 "
+
+    def _reverse_back(self):
+        """One stage back (q / Esc / the title's ‹ 뒤로), else close."""
+        if self.reverse_stage in self.KEY_STAGES:
+            self._key_back()
+        elif self.reverse_stage == "host-delete" or \
+                (self.reverse_stage == "provider" and self._pending_host):
+            self.reverse_stage = "menu"  # back to the host menu
+            self.reverse_sel = 0
+        else:
+            self.reverse_open = False
+        self._focus_dirty = True
 
     def _reverse_click(self, button, gx, gy, final):
         _x, _y, area_w, area_h = self._area()
@@ -1793,21 +2102,21 @@ class Client(object):
             self.reverse_open = False
             self._focus_dirty = True
             return
+        x0, x1 = self._reverse_back_hit
+        if gy == 1 and x0 <= gx < x1:
+            self._reverse_back()
+            return
         row = gy - 3  # title + subtitle rows
         if row < 0:
             return
         index = self.reverse_scroll + row
         if index >= len(self._reverse_rows()):
             return
-        now = time.time()
-        last_time, last_index = self._last_click
-        self.reverse_sel = index
+        self.reverse_sel = index  # one click runs it, like the sidebar
         self._focus_dirty = True
-        if last_index == ("reverse", index) and now - last_time < 0.4:
-            result = self._reverse_activate()
-            if result is not None:
-                self._explorer_result = result
-        self._last_click = (now, ("reverse", index))
+        result = self._reverse_activate()
+        if result is not None:
+            self._explorer_result = result
 
     def _reverse_chunk(self):
         _x, _y, area_w, area_h = self._area()
@@ -1821,10 +2130,14 @@ class Client(object):
         title = " SSH 키 " if keys else " 호스트 " \
             if self.reverse_stage in ("menu", "host-delete") \
             else " 리버스 에이전트 "
+        back = self._reverse_back_label()
+        fill = max(0, inner - self._width(title) - self._width(back))
         out.append(("\x1b[1;%dH" % col).encode() + edge + "┌".encode()
                    + bg + b"\x1b[1;38;5;31m" + title.encode() + edge
-                   + ("─" * max(0, inner - self._width(title))
-                      + "┐").encode() + b"\x1b[0m")
+                   + ("─" * fill).encode() + bg + b"\x1b[38;5;31m"
+                   + back.encode() + edge + "┐".encode() + b"\x1b[0m")
+        self._reverse_back_hit = (col + 1 + inner - self._width(back),
+                                  col + 1 + inner)
         key_name = (self._pending_key or {}).get("name", "")
         if self.reverse_stage == "keys":
             subtitle = " 관리 키 + ~/.ssh 자동 발견"
@@ -1984,6 +2297,11 @@ class Client(object):
             return
         if final != b"M" or gy > area_h:
             return
+        x0, x1 = self._explorer_refresh_hit
+        if gy == 1 and x0 <= gx < x1:
+            self._explorer_load()
+            self._focus_dirty = True
+            return
         row = gy - 2  # row 1 is the panel title
         if row < 0:
             return
@@ -1994,13 +2312,17 @@ class Client(object):
         last_time, last_index = self._last_click
         self.explorer_sel = index
         self._focus_dirty = True
-        if last_index == index and now - last_time < 0.4:
+        # Folders open on one click; files (which open an editor pane)
+        # still take a double click.
+        if self.explorer_entries[index][1] or \
+                (last_index == index and now - last_time < 0.4):
             result = self._explorer_open_entry()
             if result is not None:
                 self._explorer_result = result
         self._last_click = (now, index)
 
     _explorer_result = None
+    _explorer_refresh_hit = (0, 0)
 
     HELP_ANIM = 0.14  # seconds for the pop-in
 
@@ -2026,10 +2348,12 @@ class Client(object):
                                   self._pad(desc, col_w - key_w)))
             rows.append((parts, "keys"))
         rows.append(("", None))
-        rows.append(("  마우스: pane 클릭 = 포커스 · 하단 탭 클릭 = 윈도우 전환",
-                     "38;5;245"))
-        rows.append(("  왼쪽 탭에서 세션 · 호스트 클릭으로 바로 이동",
-                     "38;5;245"))
+        rows.append(("  마우스: pane 우클릭 = 분할·확대·닫기·이름 메뉴 · "
+                     "경계선 드래그 = 크기 조절", "38;5;245"))
+        rows.append(("  하단 탭 클릭 = 윈도우 전환 · + = 새 윈도우 · "
+                     "detach / help 도 클릭", "38;5;245"))
+        rows.append(("  왼쪽 탭: 세션·호스트 클릭 = 이동 · 세션 우클릭 = "
+                     "이름 바꾸기·삭제", "38;5;245"))
         rows.append(("  Ctrl-V: 클립보드 이미지를 원격 pane에 경로로 첨부",
                      "38;5;245"))
         rows.append(("  사이드바 SSH 키: 생성·공개키 복사·서버 설치·이름 변경·삭제",
@@ -2165,6 +2489,8 @@ class Client(object):
         form = self.form
         if form.get("kind") == "folder":
             return self._folder_key(unit)
+        if form.get("kind") == "prompt":
+            return self._prompt_key(unit)
         mouse = MOUSE_RE.match(unit)
         if mouse:
             if mouse.group(4) == b"M" and not int(mouse.group(1)) & 96:
@@ -2350,6 +2676,10 @@ class Client(object):
                 "Tab 완성 · ↑↓ 고르기 · Enter 변경 · Esc 취소 ",
                 (("Enter 변경", "save"), cancel), 64, 16,
                 self._folder_lines)
+        if form.get("kind") == "prompt":
+            return self._popup_chunk(
+                form, "─ %s " % form["title"], "Enter 확인 · Esc 취소 ",
+                (("Enter 확인", "save"), cancel), 54, 8, self._prompt_lines)
         return self._popup_chunk(
             form, "─ 호스트 수정 " if form.get("edit") else "─ 호스트 추가 ",
             "Tab 이동 · ←→ 키 선택 · Enter 저장 · Esc 취소 ",
@@ -2409,6 +2739,358 @@ class Client(object):
             out.append("\x1b[%d;%dH" % (top + height + 1, left + 2) + shadow
                        + " " * max(0, min(width, cols - left - 1)))
         return ("".join(out) + "\x1b[0m").encode(errors="replace")
+
+    # -- context menu -----------------------------------------------------------
+    # A small popup list at a screen cell: right-click menus (pane,
+    # session) and confirmations. Items are dicts {"label", "do",
+    # "danger"}; do() returns an AttachResult or None and may open the
+    # next popup (the menu is already closed when it runs). MENU_SEP
+    # draws a rule.
+    MENU_SEP = {"label": "", "do": None, "sep": True}
+    menu = None
+
+    def _open_menu(self, items, gx, gy, title=None, confirm=False):
+        selectable = [i for i, item in enumerate(items)
+                      if item.get("do") and not item.get("sep")]
+        self.menu = {"items": items, "x": gx, "y": gy, "title": title,
+                     "sel": selectable[0] if selectable else 0,
+                     "confirm": confirm, "hits": [], "box": None}
+        self.help_open = False
+        self.reverse_open = False
+        self._focus_dirty = True
+
+    def _menu_confirm(self, title, label, do):
+        """Replace the menu with a yes/cancel pair at the same place."""
+        x, y = self._menu_at
+        self._open_menu([{"label": label, "do": do, "danger": True},
+                         {"label": "취소", "do": lambda: None}],
+                        x, y, title=title, confirm=True)
+
+    _menu_at = (1, 1)
+
+    def _menu_activate(self, index):
+        menu = self.menu
+        item = menu["items"][index] if 0 <= index < len(menu["items"]) \
+            else None
+        if not item or not item.get("do") or item.get("sep"):
+            return None
+        self._menu_at = (menu["x"], menu["y"])
+        self.menu = None
+        self._focus_dirty = True
+        return item["do"]()
+
+    def _menu_move(self, step):
+        menu = self.menu
+        count = len(menu["items"])
+        index = menu["sel"]
+        for _ in range(count):
+            index = (index + step) % count
+            item = menu["items"][index]
+            if item.get("do") and not item.get("sep"):
+                menu["sel"] = index
+                return
+
+    def _menu_key(self, unit):
+        menu = self.menu
+        mouse = MOUSE_RE.match(unit)
+        if mouse:
+            button = int(mouse.group(1))
+            if mouse.group(4) != b"M" or button & 96:
+                return None  # releases, drags and the wheel
+            gx, gy = int(mouse.group(2)), int(mouse.group(3))
+            for row, x0, x1, index in menu["hits"]:
+                if gy == row and x0 <= gx < x1:
+                    return self._menu_activate(index)
+            y0, x0, y1, x1 = menu["box"] or (0, 0, -1, -1)
+            if not (y0 <= gy <= y1 and x0 <= gx <= x1):
+                self.menu = None  # click outside = cancel
+                self._focus_dirty = True
+            return None
+        key = latin_key(unit.decode(errors="ignore"))
+        if unit == b"\x1b" or key == "q" or (menu["confirm"] and key == "n"):
+            self.menu = None
+            self._focus_dirty = True
+        elif unit in (b"\x1b[A", b"\x1b[Z") or key == "k":
+            self._menu_move(-1)
+        elif unit in (b"\x1b[B", b"\t") or key == "j":
+            self._menu_move(1)
+        elif menu["confirm"] and key == "y":
+            return self._menu_activate(0)
+        elif key in ("\r", "\n", " "):
+            return self._menu_activate(menu["sel"])
+        return None
+
+    def _menu_chunk(self):
+        menu = self.menu
+        cols, rows = self._winsize()
+        labels = [item["label"] for item in menu["items"]]
+        title = " %s " % menu["title"] if menu["title"] else ""
+        inner = max([self._width(l) + 4 for l in labels]
+                    + [self._width(title) + 2, 16])
+        inner = min(inner, cols - 2)
+        width, height = inner + 2, len(labels) + 2
+        left = max(0, min(menu["x"] - 1, cols - width))  # 0-based
+        top = max(0, min(menu["y"] - 1, rows - 1 - height))
+        box = "\x1b[0;48;5;235;38;5;51m"
+        body = "\x1b[0;48;5;235;38;5;252m"
+        out = []
+        menu["hits"] = []
+
+        def put(row, text):
+            out.append("\x1b[%d;%dH" % (top + row + 1, left + 1) + text)
+
+        put(0, box + "╭" + self._pad("─" + title if title else "", inner,
+                                     "─") + "╮")
+        for i, item in enumerate(menu["items"]):
+            if item.get("sep"):
+                put(i + 1, box + "├" + "─" * inner + "┤")
+                continue
+            on = i == menu["sel"]
+            if on:
+                style = "\x1b[0;1;48;5;24;38;5;231m"
+            elif item.get("info"):
+                style = "\x1b[0;48;5;235;38;5;117m"
+            elif not item.get("do"):
+                style = "\x1b[0;48;5;235;38;5;242m"
+            elif item.get("danger"):
+                style = "\x1b[0;48;5;235;38;5;203m"
+            else:
+                style = body
+            put(i + 1, box + "│" + style
+                + self._pad(("▸ " if on else "  ") + item["label"], inner)
+                + box + "│")
+            if item.get("do"):
+                menu["hits"].append((top + i + 2, left + 2,
+                                     left + 2 + inner, i))
+        put(height - 1, box + "╰" + "─" * inner + "╯")
+        menu["box"] = (top + 1, left + 1, top + height, left + width)
+        return ("".join(out) + "\x1b[0m").encode(errors="replace")
+
+    # -- menus built on it ------------------------------------------------------
+    def _pane_menu(self, pane_id, gx, gy):
+        """Right-click on a pane: everything C-b does to a pane."""
+        runtime = self._runtime(pane_id)
+        zoomed = bool(self._window and self._window.get("zoomed"))
+        items = [
+            {"label": "좌우로 분할",
+             "do": lambda: AttachResult("split-v", pane_id)},
+            {"label": "위아래로 분할",
+             "do": lambda: AttachResult("split-h", pane_id)},
+            {"label": "확대 해제" if zoomed else "확대",
+             "do": lambda: AttachResult("zoom", pane_id)},
+        ]
+        if not zoomed and len(self.runtimes) > 1:
+            items.append({"label": "자리 바꾸기…",
+                          "do": lambda: self._start_swap(pane_id)})
+        root = self._reverse_root(runtime)
+        if root:
+            items[:0] = [{"label": "작업 폴더", "do": None, "info": True},
+                         {"label": self._short_path(root, 40), "do": None,
+                          "info": True},
+                         self.MENU_SEP]
+            items.append({"label": "작업 폴더 바꾸기…",
+                          "do": lambda: self._open_folder_form(pane_id)})
+        items += [self.MENU_SEP,
+                  {"label": "새 윈도우", "do": lambda: AttachResult("new")},
+                  {"label": "윈도우 이름 바꾸기…",
+                   "do": self._rename_window_prompt},
+                  self.MENU_SEP,
+                  {"label": "pane 닫기…", "danger": True,
+                   "do": lambda: self._confirm_kill_pane(pane_id)}]
+        self._open_menu(items, gx, gy)
+
+    def _short_path(self, path, limit):
+        """~-abbreviated path, its head elided to fit `limit` cells."""
+        text = self._tilde(path)
+        if self._width(text) <= limit:
+            return text
+        kept = ""
+        for char in reversed(text):
+            if self._width(kept) + char_width(char) > limit - 1:
+                break
+            kept = char + kept
+        return "…" + kept
+
+    def _window_menu(self, index, gx, gy):
+        """Right-click on a window tab: switch, rename, close."""
+        tabs = self.windows_provider() if self.windows_provider else []
+        if not 0 <= index < len(tabs):
+            return
+        name, current = tabs[index]
+        items = []
+        if not current:
+            items.append({"label": "이 윈도우로 이동",
+                          "do": lambda: AttachResult("switch",
+                                                     ("index", index))})
+        items += [{"label": "이름 바꾸기…",
+                   "do": lambda: self._rename_window_prompt(index)},
+                  self.MENU_SEP,
+                  {"label": "윈도우 닫기…", "danger": True,
+                   "do": lambda: self._menu_confirm(
+                       "%d:%s 닫을까요?" % (index, name),
+                       "닫기 (안의 pane 모두 종료)",
+                       lambda: AttachResult("kill-window", index))}]
+        self._open_menu(items, gx, gy, title="%d:%s" % (index, name))
+
+    def _confirm_kill_pane(self, pane_id):
+        runtime = self._runtime(pane_id)
+        name = runtime.pane.get("name", "pane") if runtime else "pane"
+        self._menu_confirm("%s 닫을까요?" % name, "닫기 (프로그램 종료)",
+                           lambda: AttachResult("kill-pane", (pane_id, True)))
+
+    def _session_menu(self, name, current, gx, gy):
+        items = []
+        if not current:
+            items.append({"label": "이 세션으로 이동",
+                          "do": lambda: AttachResult("switch-session",
+                                                     name)})
+        items += [{"label": "이름 바꾸기…",
+                   "do": lambda: self._rename_session_prompt(name)},
+                  self.MENU_SEP,
+                  {"label": "세션 삭제…", "danger": True,
+                   "do": lambda: self._confirm_kill_session(name)}]
+        self._open_menu(items, gx, gy, title=name)
+
+    def _confirm_kill_session(self, name):
+        self._menu_confirm("%s 삭제할까요?" % name, "삭제 (실행 중인 것 모두 종료)",
+                           lambda: AttachResult("kill-session", name))
+
+    def _sessions_menu(self):
+        """C-b s: pick a session from a popup list."""
+        sessions = (self._sidebar_data or {}).get("sessions") or []
+        if not sessions:
+            return AttachResult("choose")
+        items = [{"label": ("● " if s.get("current") else "  ") + s["name"],
+                  "do": (lambda n=s["name"]:
+                         AttachResult("switch-session", n))}
+                 for s in sessions]
+        cols, rows = self._winsize()
+        self._open_menu(items, max(1, cols // 2 - 12),
+                        max(1, (rows - len(items)) // 2), title="세션")
+        current = [i for i, s in enumerate(sessions) if s.get("current")]
+        if current:
+            self.menu["sel"] = current[0]
+        return None
+
+    # -- one-line text prompt (rename) -------------------------------------------
+    def _open_prompt(self, title, label, value, submit, note=""):
+        """submit(text) returns an error string (prompt stays), or an
+        AttachResult / None (prompt closes)."""
+        self.form = {"kind": "prompt", "title": title, "label": label,
+                     "value": value, "caret": {"value": len(value)},
+                     "view": {}, "error": None, "note": note,
+                     "submit": submit, "opened": time.time(),
+                     "cursor": None, "hits": []}
+        self.explorer_open = False
+        self.reverse_open = False
+        self.help_open = False
+        self._focus_dirty = True
+
+    def _prompt_submit(self):
+        form = self.form
+        result = form["submit"](form["value"].strip())
+        if isinstance(result, str):
+            form["error"] = result
+            return None
+        self._close_host_form()
+        return result
+
+    def _prompt_key(self, unit):
+        form = self.form
+        mouse = MOUSE_RE.match(unit)
+        if mouse:
+            if mouse.group(4) != b"M" or int(mouse.group(1)) & 96:
+                return None
+            gx, gy = int(mouse.group(2)), int(mouse.group(3))
+            for row, x0, x1, target in form["hits"]:
+                if gy == row and x0 <= gx < x1:
+                    if target == "save":
+                        return self._prompt_submit()
+                    if target == "cancel":
+                        self._close_host_form()
+                    else:
+                        form["caret"]["value"] = self._form_click_caret(
+                            form, "value", gx)
+                    return None
+            y0, x0, y1, x1 = form.get("box") or (0, 0, 10 ** 6, 10 ** 6)
+            if not (y0 <= gy <= y1 and x0 <= gx <= x1):
+                self._close_host_form()
+            return None
+        if unit == b"\x1b":
+            self._close_host_form()
+            return None
+        if unit in (b"\r", b"\n"):
+            return self._prompt_submit()
+        if self._text_edit(form, "value", unit):
+            form["error"] = None
+        return None
+
+    def _prompt_lines(self, form, top, left, inner, body, dim):
+        label_w = max(8, self._width(form["label"]) + 2)
+        lines = [body + " " * inner]
+        lines.append(self._text_field(
+            form, "value", top + len(lines) + 2, left + 4 + label_w,
+            inner - label_w - 6, form["label"], label_w, body, inner))
+        lines.append(body + " " * inner)
+        if form["error"]:
+            lines.append("\x1b[0;48;5;235;38;5;203m"
+                         + self._pad("  " + form["error"], inner))
+        else:
+            lines.append(dim + self._pad("  " + form["note"], inner))
+        lines.append(body + " " * inner)
+        lines.append(self._popup_buttons(form, top + len(lines) + 2, left,
+                                         inner, body,
+                                         (("save", "  확인  "),
+                                          ("cancel", "  취소  "))))
+        return lines
+
+    def _popup_buttons(self, form, row, left, inner, body, buttons):
+        """A centred row of buttons; records their click targets."""
+        col = left + 1 + max(1, (inner - 24) // 2)  # 0-based
+        text = body + " " * (col - left - 1)
+        for name, label in buttons:
+            form["hits"].append((row, col, col + 2 + self._width(label),
+                                 name))
+            text += "\x1b[0;48;5;244;38;5;231m" + label + body + "    "
+            col += self._width(label) + 4
+        return text + " " * max(0, inner - (col - left - 1))
+
+    @staticmethod
+    def _name_error(name):
+        try:
+            registry_mod.validate_name(name)
+        except ValueError:
+            return "글자·숫자·_ . - 만 쓸 수 있어요 (공백 없이, 64자까지)"
+        return None
+
+    def _rename_window_prompt(self, index=None):
+        """Rename the shown window, or the window at tab `index`."""
+        current = (self._window or {}).get("name", "")
+        tabs = self.windows_provider() if self.windows_provider else []
+        if index is not None and 0 <= index < len(tabs):
+            current = tabs[index][0]
+
+        def submit(name):
+            if not name or name == current:
+                return None
+            return self._name_error(name) or AttachResult(
+                "rename-window", name if index is None else (index, name))
+        self._open_prompt("윈도우 이름", "이름", current, submit,
+                          "하단 탭에 보이는 이름이에요")
+
+    def _rename_session_prompt(self, old):
+        taken = set(s["name"] for s in
+                    (self._sidebar_data or {}).get("sessions") or [])
+
+        def submit(name):
+            if not name or name == old:
+                return None
+            if name in taken:
+                return "이미 있는 세션 이름이에요"
+            return self._name_error(name) or \
+                AttachResult("rename-session", (old, name))
+        self._open_prompt("세션 이름", "이름", old, submit,
+                          "%s 세션의 새 이름" % old)
 
     # -- reverse folder popup -------------------------------------------------
     FOLDER_ROWS = 6
@@ -2575,41 +3257,64 @@ class Client(object):
                 step = 1 if unit == b"\x1b[B" else -1
                 form["sel"] = max(-1, min(len(names) - 1, form["sel"] + step))
             return None
-        value = form["path"]
-        at = min(form["caret"]["path"], len(value))
+        if self._text_edit(form, "path", unit, path=True):
+            form["sel"], form["scroll"], form["error"] = -1, 0, None
+        return None
+
+    def _text_edit(self, form, field, unit, path=False):
+        """Line editing for a popup text field (caret moves, Home/End,
+        ^A ^E ^U ^W, Backspace/Delete, typing). True if the text changed."""
+        value = form[field]
         caret = form["caret"]
+        at = min(caret[field], len(value))
         if unit in (b"\x1b[C", b"\x1b[D"):
             step = 1 if unit == b"\x1b[C" else -1
-            caret["path"] = max(0, min(len(value), at + step))
-            return None
+            caret[field] = max(0, min(len(value), at + step))
+            return False
         if unit in (b"\x1b[H", b"\x1bOH", b"\x1b[1~", b"\x01"):
-            caret["path"] = 0
-            return None
+            caret[field] = 0
+            return False
         if unit in (b"\x1b[F", b"\x1bOF", b"\x1b[4~", b"\x05"):
-            caret["path"] = len(value)
-            return None
+            caret[field] = len(value)
+            return False
         if unit in (b"\x7f", b"\x08"):
-            if at:
-                value = value[:at - 1] + value[at:]
-                at -= 1
+            if not at:
+                return False
+            value, at = value[:at - 1] + value[at:], at - 1
         elif unit in (b"\x1b[3~", b"\x04"):
             value = value[:at] + value[at + 1:]
         elif unit == b"\x15":  # ^U: clear before the caret
             value, at = value[at:], 0
-        elif unit == b"\x17":  # ^W: drop the last path component
-            cut = value[:at].rstrip("/")
-            cut = cut[:cut.rfind("/") + 1]
+        elif unit == b"\x17":  # ^W: previous word / path component
+            cut = value[:at].rstrip("/" if path else " ")
+            cut = cut[:cut.rfind("/" if path else " ") + 1]
             value, at = cut + value[at:], len(cut)
         elif unit.startswith(b"\x1b"):
-            return None  # bracketed-paste markers and other sequences
+            return False  # bracketed-paste markers and other sequences
         else:
             text = unit.decode(errors="ignore").replace("\n", "")
             if not (text and text.isprintable()):
-                return None
+                return False
             value, at = value[:at] + text + value[at:], at + len(text)
-        form["path"], caret["path"] = value, at
-        form["sel"], form["scroll"], form["error"] = -1, 0, None
-        return None
+        form[field], caret[field] = value, at
+        return True
+
+    def _text_field(self, form, field, row, col, width, label, label_w,
+                    body, inner):
+        """One labelled input box line; col is the 0-based column of the
+        box. Records the click target and the text cursor."""
+        form["hits"].append((row, col + 1, col + 1 + width, field))
+        value = form[field]
+        caret = min(form["caret"][field], len(value))
+        start = min(form["view"].get(field, (0, 0))[1], caret)
+        while self._width(value[start:caret]) > width - 2:
+            start += 1
+        form["view"][field] = (col + 1, start)
+        form["cursor"] = (row, col + 1 + self._width(value[start:caret]))
+        return (body + "  " + "\x1b[1;48;5;235;38;5;51m"
+                + self._pad(label, label_w) + "\x1b[0;48;5;238;38;5;255m "
+                + self._pad(value[start:], width - 1) + body
+                + " " * max(0, inner - 2 - label_w - width))
 
     def _folder_lines(self, form, top, left, inner, body, dim):
         """Rows of the folder popup: current folder, the path field, the
@@ -2626,21 +3331,9 @@ class Client(object):
         plain("")
         plain("  %s%s" % (self._pad("지금", label_w),
                           self._tilde(form["current"])), dim)
-        # The path field (same look and caret scrolling as the host form).
-        col = left + 4 + label_w
-        form["hits"].append((row(), col + 1, col + 1 + field_w, "path"))
-        value = form["path"]
-        caret = min(form["caret"]["path"], len(value))
-        start = min(form["view"].get("path", (0, 0))[1], caret)
-        while self._width(value[start:caret]) > field_w - 2:
-            start += 1
-        form["view"]["path"] = (col + 1, start)
-        form["cursor"] = (row(), col + 1 + self._width(value[start:caret]))
-        field = "\x1b[0;48;5;238;38;5;255m"
-        lines.append(body + "  " + "\x1b[1;48;5;235;38;5;51m"
-                     + self._pad("새 폴더", label_w) + field + " "
-                     + self._pad(value[start:], field_w - 1) + body
-                     + " " * (inner - 2 - label_w - field_w))
+        lines.append(self._text_field(form, "path", row(),
+                                      left + 4 + label_w, field_w, "새 폴더",
+                                      label_w, body, inner))
         plain("")
         names = self._folder_matches()
         visible = self.FOLDER_ROWS
@@ -2677,14 +3370,9 @@ class Client(object):
         else:
             plain("  이 폴더에서 에이전트를 새 대화로 다시 시작해요", dim)
         plain("")
-        y = row()
-        col = left + 1 + max(1, (inner - 24) // 2)  # 0-based
-        text = body + " " * (col - left - 1)
-        for name, label in (("save", "  변경  "), ("cancel", "  취소  ")):
-            form["hits"].append((y, col, col + 2 + self._width(label), name))
-            text += "\x1b[0;48;5;244;38;5;231m" + label + body + "    "
-            col += self._width(label) + 4
-        lines.append(text + " " * max(0, inner - (col - left - 1)))
+        lines.append(self._popup_buttons(form, row(), left, inner, body,
+                                         (("save", "  변경  "),
+                                          ("cancel", "  취소  "))))
         return lines
 
     def _explorer_chunk(self):
@@ -2694,12 +3382,14 @@ class Client(object):
         inner = width - 2
         out = []
         col = 1
+        refresh = " ↻ "
+        room = inner - self._width(refresh)
         title = " Files: " + (self.explorer_path or "")
-        if self._width(title) > inner:  # keep the path's tail, by width
+        if self._width(title) > room:  # keep the path's tail, by width
             kept, used = "", 0
             for char in reversed(self.explorer_path or ""):
                 w = char_width(char)
-                if used + w > inner - 9:
+                if used + w > room - 9:
                     break
                 kept = char + kept
                 used += w
@@ -2710,8 +3400,10 @@ class Client(object):
             else b"\x1b[38;5;245m"
         out.append(("\x1b[1;%dH" % col).encode() + edge + "┌".encode()
                    + bg + title_style + title.encode() + edge
-                   + ("─" * max(0, inner - self._width(title))
-                      + "┐").encode() + b"\x1b[0m")
+                   + ("─" * max(0, room - self._width(title))).encode()
+                   + bg + b"\x1b[38;5;31m" + refresh.encode() + edge
+                   + "┐".encode() + b"\x1b[0m")
+        self._explorer_refresh_hit = (col + 1 + room, col + 1 + inner)
         visible = max(1, height - 2)
         if self.explorer_sel < self.explorer_scroll:
             self.explorer_scroll = self.explorer_sel
@@ -2769,6 +3461,9 @@ class Client(object):
             return None
         if key == "z":
             return AttachResult("zoom", self.active_id)
+        if key in ("{", "}"):
+            self._swap_step(-1 if key == "{" else 1)
+            return None
         if key == "e":
             self._toggle_explorer()
             return None
@@ -2793,13 +3488,19 @@ class Client(object):
         if key.isdigit():
             return AttachResult("switch", ("index", int(key)))
         if key == "s":
-            return AttachResult("choose")
+            return self._sessions_menu()
         if key == ",":
-            return AttachResult("rename-window")
+            self._rename_window_prompt()
+            return None
         if key == "$":
-            return AttachResult("rename-session")
+            self._rename_session_prompt(self._session_name)
+            return None
         if key == "x":
-            return AttachResult("kill-pane", self.active_id)
+            rect = rects.get(self.active_id)
+            self._menu_at = (rect[0] + rect[2] // 2 - 8,
+                             rect[1] + rect[3] // 2) if rect else (1, 1)
+            self._confirm_kill_pane(self.active_id)
+            return None
         if key == "?":
             self.help_open = True
             self._help_opened_at = time.time()

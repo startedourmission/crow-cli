@@ -28,6 +28,44 @@ def eprint(*args):
     print(*args, file=sys.stderr)
 
 
+PAUSE_CLICK_RE = re.compile(rb"\x1b\[<\d+;\d+;\d+M")
+
+
+def pause(text="[Enter를 누르거나 클릭하면 돌아갑니다] "):
+    """Wait for Enter or a mouse click on the plain terminal (between
+    attaches, e.g. after a failure message)."""
+    if not sys.stdin.isatty():
+        try:
+            input(text)
+        except EOFError:
+            pass
+        return
+    import termios
+    import tty
+    fd = sys.stdin.fileno()
+    saved = termios.tcgetattr(fd)
+    # cbreak before the prompt shows (and without the default flush), so
+    # a quick click is not thrown away.
+    tty.setcbreak(fd, termios.TCSANOW)
+    sys.stdout.write(text + "\x1b[?1000h\x1b[?1006h")
+    sys.stdout.flush()
+    buf = b""
+    try:
+        while True:
+            chunk = os.read(fd, 64)
+            if not chunk:
+                break
+            buf = (buf + chunk)[-64:]
+            if b"\r" in buf or b"\n" in buf or PAUSE_CLICK_RE.search(buf):
+                break
+    except KeyboardInterrupt:
+        pass
+    finally:
+        sys.stdout.write("\x1b[?1000l\x1b[?1006l\n")
+        sys.stdout.flush()
+        termios.tcsetattr(fd, termios.TCSANOW, saved)
+
+
 # --------------------------------------------------------------- registry
 def with_registry(fn):
     reg = registry_mod.Registry()
@@ -478,7 +516,16 @@ def run_attach(name):
                 return "%s: %s" % (key["name"], "파일까지 삭제함" if deleted
                                    else "등록 해제함")
 
+            def save_layout(window_id, layout, current=name):
+                def save(reg):
+                    found = reg.find(current)
+                    for win in (found or {}).get("windows", []):
+                        if win["id"] == window_id:
+                            win["layout"] = layout
+                with_registry(save)
+
             client = Client(object(), status_provider=status_text,
+                            layout_saver=save_layout,
                             explorer_root_provider=explorer_root,
                             reverse_data_provider=reverse_data,
                             sidebar_data_provider=sidebar_data,
@@ -605,7 +652,7 @@ def run_attach(name):
                 print("[crow-cli] 키·연결 확인: %s" % record["address"])
                 check_host(record)
                 try:
-                    input("[Enter를 누르면 돌아갑니다] ")
+                    pause()
                 except EOFError:
                     pass
                 continue
@@ -643,7 +690,7 @@ def run_attach(name):
                         notice["text"] = "키 설치 실패: %s" \
                             % record["address"]
                 try:
-                    input("[Enter를 누르면 돌아갑니다] ")
+                    pause()
                 except EOFError:
                     pass
                 continue
@@ -673,7 +720,7 @@ def run_attach(name):
                     notice["text"] = "리버스 시작 실패: %s" % detail
                     eprint("crow-cli: ✗ %s" % notice["text"])
                     try:
-                        input("[Enter를 누르면 돌아갑니다] ")
+                        pause()
                     except EOFError:
                         pass
                 continue
@@ -697,7 +744,7 @@ def run_attach(name):
                     notice["text"] = "폴더 변경 실패: %s" % detail
                     eprint("crow-cli: ✗ %s" % notice["text"])
                     try:
-                        input("[Enter를 누르면 돌아갑니다] ")
+                        pause()
                     except EOFError:
                         pass
                 continue
@@ -726,7 +773,7 @@ def run_attach(name):
                     notice["text"] = "리버스 pane 시작 실패: %s" % detail
                     eprint("crow-cli: ✗ %s" % notice["text"])
                     try:
-                        input("[Enter를 누르면 돌아갑니다] ")
+                        pause()
                     except EOFError:
                         pass
                 continue
@@ -781,32 +828,104 @@ def run_attach(name):
                 with_registry(create)
                 continue
             if result.action in ("rename-window", "rename-session"):
+                # The UI's rename popup passes the new name (sessions:
+                # (old, new)); without one, ask on the plain terminal.
+                old_name, new_name = name, result.arg
+                win_index = None  # rename-window: None = the shown one
+                if isinstance(new_name, tuple):
+                    if result.action == "rename-window":
+                        win_index, new_name = new_name
+                    else:
+                        old_name, new_name = new_name
+                if not new_name:
+                    Client.leave_terminal()
+                    try:
+                        new_name = input("new name: ").strip()
+                    except EOFError:
+                        new_name = ""
                 try:
-                    new_name = input("new name: ").strip()
-                except EOFError:
-                    new_name = ""
-                if new_name:
-                    registry_mod.validate_name(new_name)
+                    if new_name:
+                        registry_mod.validate_name(new_name)
 
-                    def rename(reg):
-                        found = reg.find(name)
-                        if result.action == "rename-window":
-                            win = registry_mod.Registry.active_window(found)
-                            win["name"] = new_name
-                        else:
+                        def rename(reg, old_name=old_name,
+                                   new_name=new_name, win_index=win_index):
+                            found = reg.find(old_name)
+                            if found is None:
+                                return
+                            if result.action == "rename-window":
+                                win = registry_mod.Registry.active_window(
+                                    found) if win_index is None else \
+                                    found["windows"][win_index]
+                                win["name"] = new_name
+                                return
+                            if reg.find(new_name):
+                                raise ValueError("이미 있는 세션 이름: %s"
+                                                 % new_name)
                             found["name"] = new_name
-                    with_registry(rename)
-                    if result.action == "rename-session":
-                        name = new_name
+                        with_registry(rename)
+                        if result.action == "rename-session" and \
+                                old_name == name:
+                            name = new_name
+                except ValueError as error:
+                    notice["text"] = "이름 바꾸기 실패: %s" % error
+                continue
+            if result.action == "kill-window":
+                index = result.arg
+                found = registry_mod.load_registry().find(name)
+                if found and 0 <= index < len(found["windows"]):
+                    doomed = found["windows"][index]
+                    stop_window(doomed)
+
+                    def drop_window(reg, wid=doomed["id"]):
+                        session = reg.find(name)
+                        if session is None:
+                            return
+                        ids = [w["id"] for w in session["windows"]]
+                        if wid not in ids:
+                            return
+                        # keep the shown window shown
+                        if ids.index(wid) < session.get("active", 0):
+                            session["active"] -= 1
+                        reg.remove_window(session, wid)
+                        if not session["windows"]:
+                            reg.remove_session(name)
+                    with_registry(drop_window)
+                if registry_mod.load_registry().find(name) is None:
+                    closed, name = name, other_session(name)
+                    if name is None:
+                        Client.leave_terminal()
+                        print("[crow-cli] %s의 마지막 윈도우를 닫았습니다"
+                              % closed)
+                        return 0
+                continue
+            if result.action == "kill-session":
+                target = result.arg
+                doomed = registry_mod.load_registry().find(target)
+                if doomed is not None:
+                    for win in list(doomed["windows"]):
+                        stop_window(win)
+                    with_registry(lambda reg: reg.remove_session(target))
+                if target == name:
+                    name = other_session(name)
+                    if name is None:
+                        Client.leave_terminal()
+                        print("[crow-cli] %s 세션을 삭제했습니다 "
+                              "(남은 세션 없음)" % target)
+                        return 0
                 continue
             if result.action == "kill-pane":
-                pane = registry_mod.pane_by_id(window, result.arg) or \
+                pane_id, confirmed = result.arg if \
+                    isinstance(result.arg, tuple) else (result.arg, False)
+                pane = registry_mod.pane_by_id(window, pane_id) or \
                     registry_mod.active_pane(window)
-                try:
-                    answer = input("kill pane %s? [y/N] "
-                                   % pane["name"]).strip().lower()
-                except EOFError:
-                    answer = ""
+                answer = "y" if confirmed else ""
+                if not confirmed:
+                    Client.leave_terminal()
+                    try:
+                        answer = input("kill pane %s? [y/N] "
+                                       % pane["name"]).strip().lower()
+                    except EOFError:
+                        answer = ""
                 if answer == "y":
                     stop_pane(window, pane)
 
@@ -1536,7 +1655,7 @@ def key_screen(action, arg, notice):
     except (KeyboardInterrupt, EOFError):
         print("\n취소됨")
     try:
-        input("[Enter를 누르면 돌아갑니다] ")
+        pause()
     except (KeyboardInterrupt, EOFError):
         pass
 

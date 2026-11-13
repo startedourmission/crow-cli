@@ -1,4 +1,5 @@
 """Mouse input, the status-bar Files button / explorer, and saved hosts."""
+import json
 import os
 from pathlib import Path
 import pty
@@ -6,6 +7,7 @@ import re
 import select
 import struct
 import subprocess
+import sys
 import tempfile
 import termios
 import time
@@ -76,6 +78,134 @@ class UiTests(unittest.TestCase):
         proc.wait(timeout=10)
         os.close(master)
         return out
+
+    def test_rename_and_delete_sessions_without_leaving_crow(self):
+        self.cli("new", "-d", "-s", "demo", "-c", self.ws.name)
+        self.cli("new", "-d", "-s", "other", "-c", self.ws.name)
+        self.cli("new", "-d", "-s", "spare", "-c", self.ws.name)
+        self.addCleanup(subprocess.run, [CROW, "kill-session", "-t",
+                                         "renamed"], env=self.env,
+                        capture_output=True, timeout=30)
+        self.addCleanup(subprocess.run, [CROW, "kill-session", "-t",
+                                         "spare"], env=self.env,
+                        capture_output=True, timeout=30)
+        self.attach([
+            (b"\x02$", 0.5),             # rename popup (prefilled "demo")
+            (b"\x15renamed\r", 1.5),     # in place, no plain prompt
+            (b"\x02h", 0.5),             # sidebar: + 호스트 추가…
+            (b"k", 0.2), (b"k", 0.2),    # + 새 세션 → spare
+            (b"k", 0.2),                 # → other
+            (b"d", 0.3), (b"y", 1.5),    # delete "other" after confirm
+            (b"\x02d", 1.0),
+        ])
+        listing = self.cli("ls").stdout
+        self.assertIn("renamed", listing)
+        self.assertNotIn("demo", listing)
+        self.assertNotIn("other", listing)
+        self.assertIn("spare", listing)
+
+    def test_window_tab_menu_renames_and_closes_windows(self):
+        self.cli("new", "-d", "-s", "demo", "-c", self.ws.name)
+        self.cli("new-window", "-t", "demo", "-c", self.ws.name)
+        self.cli("new-window", "-t", "demo", "-c", self.ws.name)
+        self.cli("select-window", "-t", "demo:2")
+        state = json.loads((Path(self.home.name) / "state.json")
+                           .read_text())
+        names = [w["name"] for w in state["sessions"][0]["windows"]]
+        status = " demo | %s " % state["sessions"][0]["kind"]
+
+        def right_click(index, tabs):
+            from crowcli.client import Client  # same bar layout as crow
+            client = Client(object(), status_provider=lambda: status,
+                            windows_provider=lambda: [
+                                (n, i == 2) for i, n in enumerate(tabs)])
+            client._winsize = lambda: (80, 24)
+            client._bar_chunk()
+            x0 = next(b[0] for b in client._bar_buttons
+                      if b[2] == ("window", index))
+            return ("\x1b[<2;%d;24M" % (x0 + 1)).encode()
+        self.attach([
+            (right_click(0, names), 0.4),        # 0: 이동/이름/닫기
+            (b"\x1b[B\r", 0.4),                  # 이름 바꾸기…
+            (b"\x15first\r", 1.2),
+            (right_click(1, ["first"] + names[1:]), 0.4),
+            (b"\x1b[B\x1b[B\r", 0.3), (b"y", 1.5),  # 1 닫기 → 확인
+            (b"\x02d", 1.0),
+        ])
+        state = json.loads((Path(self.home.name) / "state.json")
+                           .read_text())
+        session = state["sessions"][0]
+        self.assertEqual([w["name"] for w in session["windows"]],
+                         ["first", names[2]])
+        self.assertEqual(session["active"], 1)  # still the shown window
+
+    def test_blank_pane_gets_a_real_resize_to_repaint(self):
+        # Like claude (Node): repaints only when the size really changes,
+        # and its screen is blank by the time crow re-attaches.
+        app = Path(self.ws.name) / "app.py"
+        app.write_text(
+            "import os, signal, sys, time\n"
+            "last = [os.get_terminal_size(1)]\n"
+            "def winch(*_):\n"
+            "    size = os.get_terminal_size(1)\n"
+            "    if size != last[0]:\n"
+            "        sys.stdout.write('\\x1b[2J\\x1b[HDRAWN %d' % size.lines)\n"
+            "        sys.stdout.flush()\n"
+            "    last[0] = size\n"
+            "signal.signal(signal.SIGWINCH, winch)\n"
+            "while True:\n"
+            "    time.sleep(0.2)\n"
+            "    if os.path.exists(%r):\n"
+            "        sys.stdout.write('\\x1b[2J\\x1b[H'); sys.stdout.flush()\n"
+            "        os.unlink(%r)\n".replace("%r", repr(str(app) + ".clear")))
+        self.cli("new", "-d", "-s", "demo", "-c", self.ws.name, "--",
+                 "%s %s" % (sys.executable, app))
+        self.attach([(b"\x02d", 1.0)])  # sizes the pty for this terminal
+        Path(str(app) + ".clear").write_text("")
+        time.sleep(0.8)  # the app wiped its screen
+        out = self.attach([(b"", 1.5), (b"\x02d", 1.0)])
+        self.assertIn(b"DRAWN", out)
+
+    def test_prefix_x_closes_pane_after_in_ui_confirm(self):
+        self.cli("new", "-d", "-s", "demo", "-c", self.ws.name)
+        self.cli("split-window", "-t", "demo", "-c", self.ws.name)
+        self.attach([(b"\x02x", 0.5), (b"y", 1.5), (b"\x02d", 1.0)])
+        state = json.loads((Path(self.home.name) / "state.json")
+                           .read_text())
+        self.assertEqual(len(state["sessions"][0]["windows"][0]["panes"]),
+                         1)
+
+    def test_pause_returns_on_click(self):
+        master, slave = pty.openpty()
+        proc = subprocess.Popen(
+            [sys.executable, "-c", "import sys; sys.path.insert(0, %r); "
+             "from crowcli.cli import pause; pause(); print('back')"
+             % str(REPO)], stdin=slave, stdout=slave, stderr=slave)
+        os.close(slave)
+        out = b""
+        deadline = time.time() + 5
+        while b"\x1b[?1000h" not in out and time.time() < deadline:
+            if select.select([master], [], [], 0.1)[0]:
+                out += os.read(master, 4096)
+        os.write(master, b"\x1b[<0;10;5M")
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            if not select.select([master], [], [], 0.2)[0]:
+                if proc.poll() is not None:
+                    break
+                continue
+            try:
+                chunk = os.read(master, 4096)
+            except OSError:
+                break
+            if not chunk:
+                break
+            out += chunk
+        proc.wait(timeout=5)
+        os.close(master)
+        self.assertIn("클릭".encode(), out)
+        self.assertIn(b"back", out)
+        self.assertIn(b"\x1b[?1000l", out)
 
     def test_saved_hosts_crud(self):
         self.cli("host", "add", "mac", "--address", "me@10.0.0.5",
@@ -793,24 +923,382 @@ class ReverseFolderTests(unittest.TestCase):
         result = self.type(b"b", b"e", b"t", b"a", b"\r")
         self.assertEqual(result.arg, ("r", os.path.join(self.root, "beta")))
 
-    def test_right_click_opens_only_on_reverse_panes(self):
+    def test_right_click_opens_pane_menu_with_folder_item(self):
         x = self.client._area()[0]
         rects = {"r": (x, 0, 30, 20), "s": (x + 31, 0, 30, 20)}
-        right = ("\x1b[<2;%d;5M" % (x + 40)).encode()
-        self.client._input(right, rects)  # plain pane
-        self.assertIsNone(self.client.form)
-        self.client.active_id = "s"
+        self.client._input(("\x1b[<2;%d;5M" % (x + 40)).encode(), rects)
+        self.assertEqual(self.client.active_id, "s")
+        labels = [i["label"] for i in self.client.menu["items"]]
+        self.assertIn("좌우로 분할", labels)
+        self.assertNotIn("작업 폴더 바꾸기…", labels)
+        self.client._input(b"\x1b", {}, flush_esc=True)
+        self.assertIsNone(self.client.menu)
         self.client._input(("\x1b[<2;%d;5M" % (x + 5)).encode(), rects)
         self.assertEqual(self.client.active_id, "r")
-        self.assertEqual(self.client.form["pane"], "r")
+        items = self.client.menu["items"]
+        self.assertEqual([i["label"] for i in items[:2]],
+                         ["작업 폴더", self.client._tilde(self.root)])
+        self.assertTrue(items[1]["info"])
+        self.assertEqual(items[self.client.menu["sel"]]["label"],
+                         "좌우로 분할")  # the folder rows aren't picked
+        self.client._menu_chunk()
+        hit = next(h for h in self.client.menu["hits"]
+                   if self.client.menu["items"][h[3]]["label"]
+                   == "작업 폴더 바꾸기…")
         self.client._input(("\x1b[<2;%d;5m" % (x + 5)).encode(), rects)
-        self.assertIsNotNone(self.client.form)
+        self.assertIsNotNone(self.client.menu)  # release: ignored
+        self.client._input(("\x1b[<0;%d;%dM" % (hit[1], hit[0])).encode(),
+                           rects)
+        self.assertIsNone(self.client.menu)
+        self.assertEqual(self.client.form["kind"], "folder")
+        self.assertEqual(self.client.form["pane"], "r")
 
     def test_prefix_f_on_plain_pane_only_flashes(self):
         self.client.active_id = "s"
         self.type(b"\x02", b"f")
         self.assertIsNone(self.client.form)
         self.assertIn("리버스", self.client._paste_msg[0])
+
+
+class MouseMenuTests(unittest.TestCase):
+    """Right-click menus, rename prompts, bar buttons, panel clicks,
+    divider drags and clickable crow prompts."""
+
+    def setUp(self):
+        from unittest import mock
+        from crowcli import imswitch
+        from crowcli.client import Client, PaneRuntime
+        patcher = mock.patch.multiple(imswitch, to_latin=lambda: None,
+                                      restore=lambda _id: None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.addCleanup(setattr, Client, "sidebar_open", Client.sidebar_open)
+        self.sent = []
+        sent = self.sent
+
+        class Conn(object):
+            def send(self, kind, data):
+                sent.append(data)
+
+            def send_size(self, cols, rows):
+                pass
+        self.saved_layouts = []
+        client = Client(object(), sidebar_data_provider=lambda: {
+            "sessions": [{"name": "main", "current": True},
+                         {"name": "work"}],
+            "hosts": [], "keys": []},
+            windows_provider=lambda: [("main", True)],
+            layout_saver=lambda wid, layout: self.saved_layouts.append(
+                (wid, json_copy(layout))))
+        client._winsize = lambda: (100, 30)
+        client._session_name = "main"
+        client._window = {
+            "id": "w", "name": "main", "meta": {}, "active_pane": 0,
+            "layout": {"split": "v", "ratio": 0.5,
+                       "a": {"leaf": "p1"}, "b": {"leaf": "p2"}},
+            "panes": [{"id": "p1", "name": "pane0", "meta": {}},
+                      {"id": "p2", "name": "pane1", "meta": {}}]}
+        client.runtimes = [PaneRuntime(p, client._window)
+                           for p in client._window["panes"]]
+        for runtime in client.runtimes:
+            runtime.conn = Conn()
+        client.active_id = "p1"
+        client._refresh_sidebar()
+        self.client = client
+
+    def press(self, *units, **kw):
+        result = None
+        for unit in units:
+            self.client._sidebar_chunk()
+            if self.client.menu is not None:
+                self.client._menu_chunk()
+            if self.client.form is not None:
+                self.client.form["opened"] = 0
+                self.client._form_chunk()
+            result = self.client._input(unit, kw.get("rects", {}))
+        return result
+
+    def click_menu(self, label, rects=None):
+        self.client._menu_chunk()
+        row, x0, _x1, _index = next(
+            h for h in self.client.menu["hits"]
+            if self.client.menu["items"][h[3]]["label"] == label)
+        return self.press(("\x1b[<0;%d;%dM" % (x0, row)).encode(),
+                          rects=rects or {})
+
+    def test_pane_menu_split_and_kill_confirm(self):
+        rects = self.client._rects()
+        x, y, w, h = rects["p2"]
+        result = self.press(("\x1b[<2;%d;%dM" % (x + 3, y + 3)).encode(),
+                            rects=rects)
+        self.assertIsNone(result)
+        self.assertEqual(self.client.active_id, "p2")
+        result = self.click_menu("좌우로 분할", rects)
+        self.assertEqual((result.action, result.arg), ("split-v", "p2"))
+        self.press(("\x1b[<2;%d;%dM" % (x + 3, y + 3)).encode(), rects=rects)
+        self.assertIsNone(self.click_menu("pane 닫기…", rects))
+        self.assertTrue(self.client.menu["confirm"])
+        self.assertIsNone(self.click_menu("취소", rects))
+        self.assertIsNone(self.client.menu)
+
+    def test_prefix_x_confirms_in_place(self):
+        rects = self.client._rects()
+        self.press(b"\x02", b"x", rects=rects)
+        self.assertIn("pane0", self.client.menu["title"])
+        result = self.press(b"y", rects=rects)
+        self.assertEqual((result.action, result.arg),
+                         ("kill-pane", ("p1", True)))
+
+    def test_rename_window_prompt_validates(self):
+        self.press(b"\x02", b",")
+        self.assertEqual(self.client.form["value"], "main")
+        self.press(b"\x15", *[c.encode() for c in "my win"])
+        self.assertIsNone(self.press(b"\r"))
+        self.assertIn("공백", self.client.form["error"])
+        self.press(b"\x17", b"\x7f", b"-", b"w", b"i", b"n")  # ^W, ⌫
+        result = self.press(b"\r")
+        self.assertEqual((result.action, result.arg),
+                         ("rename-window", "my-win"))
+        self.assertIsNone(self.client.form)
+
+    def test_session_right_click_rename_and_delete(self):
+        self.client._sidebar_chunk()
+        row = next(r for r, a in self.client._sidebar_rows
+                   if a == ("switch-session", "work"))
+        self.press(("\x1b[<2;3;%dM" % (row + 1)).encode())
+        self.assertEqual(self.client.menu["title"], "work")
+        self.click_menu("이름 바꾸기…")
+        self.press(b"\x15", b"m", b"a", b"i", b"n")
+        self.assertIsNone(self.press(b"\r"))
+        self.assertIn("이미 있는", self.client.form["error"])
+        result = self.press(b"2", b"\r")
+        self.assertEqual((result.action, result.arg),
+                         ("rename-session", ("work", "main2")))
+        self.press(("\x1b[<2;3;%dM" % (row + 1)).encode())
+        self.click_menu("세션 삭제…")
+        result = self.click_menu("삭제 (실행 중인 것 모두 종료)")
+        self.assertEqual((result.action, result.arg),
+                         ("kill-session", "work"))
+
+    def test_sidebar_keys_d_and_e_on_sessions(self):
+        self.press(b"\x02", b"h")
+        for _ in range(3):  # add-host → + 새 세션 → work
+            if self.client._sidebar_pick == ("switch-session", "work"):
+                break
+            self.press(b"k")
+        self.assertEqual(self.client._sidebar_pick,
+                         ("switch-session", "work"))
+        self.press(b"d")
+        self.assertTrue(self.client.menu["confirm"])
+        result = self.press(b"y")
+        self.assertEqual(result.action, "kill-session")
+        self.press(b"e")
+        self.assertEqual(self.client.form["kind"], "prompt")
+
+    def test_prefix_s_lists_sessions(self):
+        self.press(b"\x02", b"s")
+        labels = [i["label"].strip() for i in self.client.menu["items"]]
+        self.assertEqual(labels, ["● main", "work"])
+        result = self.press(b"j", b"\r")
+        self.assertEqual((result.action, result.arg),
+                         ("switch-session", "work"))
+
+    def test_bar_buttons_new_window_help_detach(self):
+        bar = self.client._bar_chunk()
+        self.assertIn(b" + ", bar)
+        buttons = dict((b[2], b) for b in self.client._bar_buttons
+                       if isinstance(b[2], str))
+
+        def click(name):
+            x0 = buttons[name][0]
+            return self.press(("\x1b[<0;%d;30M" % x0).encode())
+        self.assertEqual(click("new-window").action, "new")
+        self.assertIsNone(click("help"))
+        self.assertTrue(self.client.help_open)
+        self.press(b"\x1b[<0;50;30m")  # the click's release keeps it
+        self.assertTrue(self.client.help_open)
+        self.press(b"q")
+        self.assertEqual(click("detach").action, "detach")
+
+    def test_window_tab_right_click_rename_and_close(self):
+        self.client.windows_provider = lambda: [("main", True),
+                                                ("logs", False)]
+        self.client._bar_chunk()
+        tab = next(b for b in self.client._bar_buttons
+                   if b[2] == ("window", 1))
+        self.press(("\x1b[<2;%d;30M" % tab[0]).encode())
+        self.assertEqual(self.client.menu["title"], "1:logs")
+        menu_box = self.client._menu_chunk() and self.client.menu["box"]
+        self.assertLess(menu_box[2], 30)  # drawn above the bar
+        self.click_menu("이름 바꾸기…")
+        self.assertEqual(self.client.form["value"], "logs")
+        result = self.press(b"2", b"\r")
+        self.assertEqual((result.action, result.arg),
+                         ("rename-window", (1, "logs2")))
+        self.press(("\x1b[<2;%d;30M" % tab[0]).encode())
+        result = self.click_menu("이 윈도우로 이동")
+        self.assertEqual((result.action, result.arg),
+                         ("switch", ("index", 1)))
+        self.press(("\x1b[<2;%d;30M" % tab[0]).encode())
+        self.click_menu("윈도우 닫기…")
+        result = self.click_menu("닫기 (안의 pane 모두 종료)")
+        self.assertEqual((result.action, result.arg), ("kill-window", 1))
+
+    def test_swap_panes_by_menu_then_click(self):
+        rects = self.client._rects()
+        x2, y2, _w2, _h2 = rects["p2"]
+        x1, y1, _w1, _h1 = rects["p1"]
+        self.press(("\x1b[<2;%d;%dM" % (x2 + 3, y2 + 3)).encode(), rects=rects)
+        self.assertIsNone(self.click_menu("자리 바꾸기…", rects))
+        self.assertEqual(self.client._swap_from, "p2")
+        self.assertIn("클릭", self.client._paste_msg[0])
+        self.press(("\x1b[<2;%d;%dm" % (x2 + 3, y2 + 3)).encode(),
+                   rects=rects)  # the menu click's release: still waiting
+        self.press(("\x1b[<0;%d;%dM" % (x1 + 3, y1 + 3)).encode(),
+                   rects=rects)
+        self.assertIsNone(self.client._swap_from)
+        layout = self.client._window["layout"]
+        self.assertEqual((layout["a"]["leaf"], layout["b"]["leaf"]),
+                         ("p2", "p1"))
+        self.assertEqual(self.client.active_id, "p2")
+        self.assertEqual(self.saved_layouts[-1][1]["a"], {"leaf": "p2"})
+        self.assertEqual(self.client._rects()["p2"][0], x1)  # now on the left
+        self.assertEqual(self.sent, [])  # the pick click isn't forwarded
+
+    def test_swap_mode_cancels_on_escape_and_prefix_braces_swap(self):
+        self.client._start_swap("p1")
+        self.client._input(b"\x1b", {}, flush_esc=True)
+        self.assertIsNone(self.client._swap_from)
+        self.assertEqual(self.client._window["layout"]["a"], {"leaf": "p1"})
+        self.press(b"\x02", b"}")
+        layout = self.client._window["layout"]
+        self.assertEqual((layout["a"]["leaf"], layout["b"]["leaf"]),
+                         ("p2", "p1"))
+        self.press(b"\x02", b"{")
+        self.assertEqual(self.client._window["layout"]["a"], {"leaf": "p1"})
+        self.assertEqual(len(self.saved_layouts), 2)
+
+    def test_blank_pane_nudge_resizes_then_restores(self):
+        sizes = []
+
+        class Conn(object):
+            def __init__(self, name):
+                self.name = name
+
+            def send_size(self, cols, rows):
+                sizes.append((self.name, cols, rows))
+        client = self.client
+        rects = client._rects()
+        for runtime in client.runtimes:
+            runtime.conn = Conn(runtime.id)
+            runtime.screen.resize(rects[runtime.id][2], rects[runtime.id][3])
+        client.runtimes[1].screen.feed(b"$ prompt")
+        client._nudge_at, client._unnudge_at, client._nudged = 10.0, None, []
+        client._nudge_tick(rects, 9.0)
+        self.assertEqual(sizes, [])
+        client._nudge_tick(rects, 10.0)
+        w, h = rects["p1"][2], rects["p1"][3]
+        self.assertEqual(sizes, [("p1", w, h - 1)])  # only the blank one
+        client._nudge_tick(rects, 10.0 + client.NUDGE_HOLD)
+        self.assertEqual(sizes, [("p1", w, h - 1), ("p1", w, h)])
+        client._nudge_tick(rects, 20.0)
+        self.assertEqual(len(sizes), 2)  # once per attach
+
+    def test_drag_divider_resizes_and_saves(self):
+        from crowcli.client import split_dividers
+        area = self.client._area()
+        node, split, strip, origin, span = split_dividers(
+            self.client._window["layout"], *area)[0]
+        gx, gy = strip[0] + 1, strip[1] + 5
+        self.press(("\x1b[<0;%d;%dM" % (gx, gy)).encode(),
+                   rects=self.client._rects())
+        self.assertIsNotNone(self.client._drag)
+        self.press(("\x1b[<32;%d;%dM" % (gx + 10, gy)).encode())
+        self.assertGreater(node["ratio"], 0.55)
+        self.assertTrue(self.client._focus_dirty)
+        self.press(("\x1b[<32;%d;%dM" % (2, gy)).encode())  # clamped
+        self.assertGreater(node["ratio"], 0)
+        rects = self.client._rects()
+        self.assertGreaterEqual(rects["p1"][2], 2)
+        self.press(("\x1b[<0;%d;%dm" % (gx + 10, gy)).encode())
+        self.assertIsNone(self.client._drag)
+        self.assertEqual(self.saved_layouts[-1][0], "w")
+        self.assertEqual(self.saved_layouts[-1][1]["ratio"], node["ratio"])
+        self.assertEqual(self.sent, [])  # nothing leaked to the panes
+
+    def test_reverse_panel_single_click_and_back(self):
+        client = self.client
+        client._toggle_reverse = lambda: setattr(
+            client, "reverse_open", not client.reverse_open)
+        client._open_reverse_for_host({"name": "mac", "address": "a@b"})
+        client._reverse_chunk()
+        index = [r["kind"] for r in client._reverse_rows()].index(
+            "reverse-open")
+        x = client._area()[0] + 3
+        self.press(("\x1b[<0;%d;%dM" % (x, index + 3)).encode())
+        self.assertEqual(client.reverse_stage, "provider")  # one click
+        client._reverse_chunk()
+        x0, _x1 = client._reverse_back_hit
+        self.press(("\x1b[<0;%d;1M" % x0).encode())
+        self.assertEqual(client.reverse_stage, "menu")
+        client._reverse_chunk()
+        self.assertIn("닫기", client._reverse_back_label())
+        self.press(("\x1b[<0;%d;1M" % client._reverse_back_hit[0]).encode())
+        self.assertFalse(client.reverse_open)
+
+    def test_explorer_folder_single_click_and_refresh(self):
+        client = self.client
+        with tempfile.TemporaryDirectory(prefix="ccw-", dir="/tmp") as ws:
+            Path(ws, "sub").mkdir()
+            client.explorer_root_provider = lambda _pane: ws
+            client._toggle_explorer()
+            client._explorer_chunk()
+            names = [e[0] for e in client.explorer_entries]
+            row = names.index("sub") + 2
+            self.press(("\x1b[<0;4;%dM" % row).encode())
+            self.assertEqual(client.explorer_path,
+                             os.path.realpath(os.path.join(ws, "sub")))
+            Path(ws, "sub", "new.txt").write_text("x")
+            client._explorer_chunk()
+            self.press(("\x1b[<0;%d;1M"
+                        % client._explorer_refresh_hit[0]).encode())
+            self.assertIn("new.txt", [e[0] for e in
+                                      client.explorer_entries])
+
+    def test_ssh_drop_prompt_options_are_clickable(self):
+        rects = self.client._rects()
+        x, y, w, h = rects["p2"]
+        runtime = self.client._runtime("p2")
+        runtime.screen.resize(w, h)
+        prompt = "[crow-cli] ssh 연결이 끊겼습니다 — Enter: 다시 접속 · " \
+            "q: 연결 끊기 · s: 로컬 셸 "
+        runtime.screen.feed(prompt.encode())
+        row_text = "".join(c[0] for c in runtime.screen.lines_for_view(0)[0])
+        self.assertIn("ssh", row_text)
+        lines = runtime.screen.lines_for_view(0)
+        hit = None
+        for r, line in enumerate(lines[:3]):
+            text = "".join(c[0] for c in line)
+            if "q: 연결" in text:
+                col = 0
+                for c in line:
+                    if "".join(cc[0] for cc in line[:col + 1]).endswith("q"):
+                        break
+                    col += 1
+                hit = (col, r)
+                break
+        self.assertIsNotNone(hit)
+        gx, gy = x + hit[0] + 1, y + hit[1] + 1
+        self.press(("\x1b[<0;%d;%dM" % (gx, gy)).encode(), rects=rects)
+        self.assertEqual(self.sent, [b"q\r"])
+        self.assertEqual(self.client.active_id, "p2")
+        self.press(("\x1b[<0;%d;%dM" % (x + 1, y + h)).encode(), rects=rects)
+        self.assertEqual(self.sent, [b"q\r"])  # plain text: nothing sent
+
+
+def json_copy(value):
+    import json
+    return json.loads(json.dumps(value))
 
 
 class ImagePasteTests(unittest.TestCase):
@@ -883,7 +1371,8 @@ class WindowTabTests(unittest.TestCase):
         self.assertIn(b"\x1b[0;1;48;5;45;38;5;16m 1:logs ", bar)  # current
         self.assertIn(b" 0:main ", bar)
         tabs = [b for b in client._bar_buttons
-                if b[2] not in ("explorer", "sidebar")]
+                if b[2] not in ("explorer", "sidebar", "new-window",
+                                "detach", "help")]
         self.assertEqual([b[2] for b in tabs],
                          [("window", 0), ("window", 1), ("window", 2)])
         # Tabs follow the session block (one gap cell); hints sit flush right.
