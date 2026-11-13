@@ -32,8 +32,23 @@ INSTRUCTIONS = (
     "searches, git, tests, and shell commands. Server-side tools are "
     "disabled or denied. Never use server filesystem paths for project "
     "work. Begin by calling workspace_info. Use shell for searches or "
-    "commands not covered by the other client tools. Read AGENTS.md and "
-    "CLAUDE.md on the client if present.")
+    "commands not covered by the other client tools. Web search and web "
+    "fetch are fine for reading the web. Subagents you start must also "
+    "use only crow_client tools on the client workspace {root}: say so in "
+    "their prompt. Read AGENTS.md and CLAUDE.md on the client if present "
+    "and not already included below.")
+
+# Client project instruction files carried into the agent's instructions
+# (the agent itself starts in a private server folder, so it would never
+# pick them up on its own).
+NOTE_FILES = ("CLAUDE.md", ".claude/CLAUDE.md", "CLAUDE.local.md",
+              "AGENTS.md")
+NOTES_MAX = 30000  # characters, all files together
+
+# Server-side tools that touch no server files: web reads and subagents
+# (which are held to the same guard).
+OPEN_TOOLS = ("WebSearch", "WebFetch", "Task", "Agent", "TodoWrite",
+              "AskUserQuestion", "update_plan", "request_user_input")
 
 REPLAYABLE = {"workspace_info", "list_directory", "read_file"}
 
@@ -259,8 +274,7 @@ def guard():
     request = json.load(sys.stdin)
     name = request.get("tool_name", "")
     allowed = re.search(r"(?:^|__)crow_client__", name) is not None
-    allowed = allowed or name in ("update_plan", "request_user_input",
-                                  "AskUserQuestion", "TodoWrite")
+    allowed = allowed or name in OPEN_TOOLS
     return {"hookSpecificOutput": {
         "hookEventName": "PreToolUse",
         "permissionDecision": "allow" if allowed else "deny",
@@ -384,6 +398,11 @@ def prepare(request):
         return target
 
     instructions = INSTRUCTIONS.format(root=request["client_root"])
+    notes = request.get("project_notes")
+    if notes:
+        instructions += ("\n\nProject instructions from the client "
+                         "workspace (already read for you; follow them):"
+                         "\n\n" + notes[:NOTES_MAX + 2000])
     runtime_flag = []
     if request.get("runtime_path"):
         runtime_flag = [request["runtime_path"]]
@@ -428,7 +447,8 @@ def prepare(request):
             {"mcpServers": {"crow_client": server}}))
         settings = write("settings.json", json.dumps(
             {"hooks": hooks, "disableAllHooks": False}))
-        argv = [executable, "--dangerously-skip-permissions", "--tools", "",
+        argv = [executable, "--dangerously-skip-permissions", "--tools",
+                ",".join(t for t in OPEN_TOOLS if t[0].isupper()),
                 "--strict-mcp-config", "--mcp-config", config,
                 "--settings", settings, "--append-system-prompt",
                 instructions]
@@ -443,14 +463,14 @@ def prepare(request):
                 "-c", "developer_instructions=" + _toml(instructions),
                 "-c", "projects." + json.dumps(workspace) +
                 ".trust_level=\"trusted\"",
-                "--enable", "hooks", "--disable", "shell_tool",
-                "--disable", "multi_agent"]
+                "--enable", "hooks", "--disable", "shell_tool"]
+        if "--search" in help_text:
+            argv.append("--search")  # live web search
     else:  # grok, current TUI shape (Crow's fallback)
         if "--rules" not in help_text or "--always-approve" not in help_text:
             raise ValueError("Update Grok on the server: this version "
                              "does not support client tool routing.")
-        denies = ["Bash", "Read", "Edit", "Write", "Grep", "Glob",
-                  "WebFetch", "WebSearch"]
+        denies = ["Bash", "Read", "Edit", "Write", "Grep", "Glob"]
 
         def plant(relative, text):
             target = os.path.join(workspace, relative)
@@ -472,7 +492,7 @@ def prepare(request):
             "[plugins]", 'enabled = ["crow-client"]', "",
             "[permission]", "deny = " + json.dumps(denies), ""]))
         argv = [executable, "--always-approve", "--no-leader",
-                "--no-subagents", "--trust", "--rules", instructions]
+                "--trust", "--rules", instructions]
         for rule in denies:
             argv += ["--deny", rule]
 
@@ -494,6 +514,140 @@ def prepare(request):
     command = path_prefix + "exec " + \
         " ".join(shlex.quote(a) for a in argv)
     return {"directory": workspace, "launch": launch, "command": command}
+
+
+def project_notes(root):
+    """The client folder's agent instruction files, joined and capped
+    (runs on the client; prepare appends them to the instructions)."""
+    parts, used = [], 0
+    for relative in NOTE_FILES:
+        path = os.path.join(root, relative)
+        if not os.path.isfile(path) or used >= NOTES_MAX:
+            continue
+        try:
+            with open(path, encoding="utf-8", errors="replace") as stream:
+                text = stream.read(NOTES_MAX + 1)
+        except OSError:
+            continue
+        room = NOTES_MAX - used
+        clipped = text[:room]
+        used += len(clipped)
+        parts.append("--- %s ---\n%s%s" % (
+            relative, clipped.rstrip("\n"),
+            "\n[… truncated]" if len(text) > room else ""))
+    return "\n\n".join(parts)
+
+
+# ---------------------------------------------------------------- history
+HISTORY_LIMIT = 20
+
+
+def _first_text(content):
+    if isinstance(content, str):
+        return content
+    for item in content or []:
+        if isinstance(item, dict) and item.get("type") in (
+                "text", "input_text") and item.get("text"):
+            return item["text"]
+    return ""
+
+
+def _title(text):
+    text = " ".join((text or "").split())
+    if not text or text.startswith("<"):  # command / context wrappers
+        return ""
+    return text[:80]
+
+
+def _claude_history(workspace):
+    base = os.environ.get("CLAUDE_CONFIG_DIR") or \
+        os.path.expanduser("~/.claude")
+    folder = os.path.join(base, "projects",
+                          re.sub(r"[^A-Za-z0-9]", "-", workspace))
+    found = []
+    try:
+        names = [n for n in os.listdir(folder) if n.endswith(".jsonl")]
+    except OSError:
+        return found
+    for name in names:
+        path = os.path.join(folder, name)
+        title, summary = "", ""
+        try:
+            with open(path, encoding="utf-8", errors="replace") as stream:
+                for count, line in enumerate(stream):
+                    if count > 400 or (title and summary):
+                        break
+                    try:
+                        entry = json.loads(line)
+                    except ValueError:
+                        continue
+                    if entry.get("type") == "summary" and not summary:
+                        summary = _title(entry.get("summary"))
+                    elif entry.get("type") == "user" and not title and \
+                            not entry.get("isMeta"):
+                        title = _title(_first_text(
+                            (entry.get("message") or {}).get("content")))
+            updated = os.path.getmtime(path)
+        except OSError:
+            continue
+        if summary or title:
+            found.append({"id": name[:-len(".jsonl")],
+                          "title": summary or title, "updated": updated})
+    return found
+
+
+def _codex_history(workspace):
+    base = os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")
+    found = []
+    for folder, _dirs, files in os.walk(os.path.join(base, "sessions")):
+        for name in files:
+            if not (name.startswith("rollout-") and name.endswith(".jsonl")):
+                continue
+            path = os.path.join(folder, name)
+            ident, title = None, ""
+            try:
+                with open(path, encoding="utf-8", errors="replace") as stream:
+                    for count, line in enumerate(stream):
+                        if count > 400 or title:
+                            break
+                        try:
+                            entry = json.loads(line)
+                        except ValueError:
+                            continue
+                        payload = entry.get("payload") or {}
+                        if entry.get("type") == "session_meta":
+                            if payload.get("cwd") != workspace:
+                                break
+                            ident = payload.get("id")
+                        elif ident and payload.get("type") == "user_message":
+                            title = _title(payload.get("message"))
+                        elif ident and payload.get("role") == "user":
+                            title = _title(_first_text(
+                                payload.get("content")))
+                updated = os.path.getmtime(path)
+            except OSError:
+                continue
+            if ident and title:
+                found.append({"id": ident, "title": title,
+                              "updated": updated})
+    return found
+
+
+def history(request):
+    """Runs on the server: this client folder's earlier conversations
+    with the provider, newest first, for resuming."""
+    workspace = server_workspace(request["client_id"],
+                                 request["client_root"],
+                                 request.get("server_home"))
+    provider = request["provider"]
+    if provider == "claude":
+        found = _claude_history(workspace)
+    elif provider == "codex":
+        found = _codex_history(workspace)
+    else:
+        found = []
+    found.sort(key=lambda item: -item["updated"])
+    return found[:HISTORY_LIMIT]
 
 
 def _rand():
