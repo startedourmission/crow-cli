@@ -65,6 +65,9 @@ class Screen(object):
         self.esc_intermediate = ""
         self.grid = [self._line() for _ in range(self.rows)]
         self.scrollback = []
+        # Lines ever pushed into the scrollback: (pushed - len(scrollback))
+        # + index names a line stably while the scrollback trims its head.
+        self.pushed = 0
         self.cx = 0
         self.cy = 0
         self.attr = DEFAULT_ATTR
@@ -355,6 +358,7 @@ class Screen(object):
             line = self.grid.pop(top)
             if not self.alt and top == 0:
                 self.scrollback.append(line)
+                self.pushed += 1
                 del self.scrollback[:-10000]
             self.grid.insert(bottom, self._line())
         for y in range(top, bottom + 1):

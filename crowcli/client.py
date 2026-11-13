@@ -1049,18 +1049,24 @@ class Client(object):
             rows = range(h) if (force or scrolled) else \
                 sorted(runtime.screen.dirty)
             visible = runtime.screen.lines_for_view(runtime.view_offset)
+            picked = self._selected_spans(runtime)
             for row in rows:
                 if row >= h or row >= len(visible):
                     continue
                 chunks.append(("\x1b[%d;%dH" % (y + row + 1, x + 1)).encode())
                 attr = DEFAULT_ATTR
                 line = visible[row]
-                for cell in line:
+                span = picked.get(row) if picked else None
+                for col, cell in enumerate(line):
                     if cell[0] == "":  # wide-char continuation
                         continue
-                    if cell[1] != attr:
-                        chunks.append(sgr_for(cell[1], attr))
-                        attr = cell[1]
+                    cell_attr = cell[1]
+                    if span and span[0] <= col <= span[1]:
+                        cell_attr = cell_attr[:6] + (not cell_attr[6],) \
+                            + cell_attr[7:]
+                    if cell_attr != attr:
+                        chunks.append(sgr_for(cell_attr, attr))
+                        attr = cell_attr
                     chunks.append(cell[0].encode(errors="replace"))
                 if attr != DEFAULT_ATTR:
                     chunks.append(b"\x1b[0m")
@@ -1273,6 +1279,7 @@ class Client(object):
     _unnudge_at = None
 
     def _loop(self, out, stdin_fd):
+        self._out = out
         rects = self._rects()
         self._nudge_at = time.time() + self.NUDGE_DELAY
         self._unnudge_at = None
@@ -1441,6 +1448,9 @@ class Client(object):
             return self._form_key(unit)
         if self.menu is not None:
             return self._menu_key(unit)
+        if self._select is not None and not MOUSE_RE.match(unit):
+            self._select = None
+            self._focus_dirty = True
         if self._swap_from is not None and not MOUSE_RE.match(unit):
             self._end_swap()
             self._focus_dirty = True
@@ -1548,7 +1558,7 @@ class Client(object):
                 except (OSError, subprocess.SubprocessError):
                     pass
             threading.Thread(target=run, daemon=True).start()
-        else:
+        elif out is not None:
             out.write(b"\x1b]52;c;" + base64.b64encode(data) + b"\x07")
             out.flush()
         chars = len(data.decode("utf-8", "replace"))
@@ -1577,6 +1587,140 @@ class Client(object):
                     pass
 
     _drag = None  # (node, split, strip, origin, span) while resizing
+
+    # -- text selection in panes whose app doesn't use the mouse ---------
+    # Positions are (line, col): line counts from the first line ever
+    # scrolled off, so a selection holds still while the pane scrolls.
+    _select = None  # {"pane", "anchor", "end", "active", "moved"}
+    _last_press = (0.0, None, 0)  # time, (pane, line, col), click count
+    _out = None  # the attach output, for OSC 52 copies
+    WORD_STOP = set(" \t()[]{}<>\"'`,;|")
+
+    @staticmethod
+    def _view_start(runtime):
+        screen = runtime.screen
+        back = len(screen.scrollback)
+        total = back + len(screen.grid)
+        return (screen.pushed - back) + max(
+            0, total - min(runtime.view_offset, back) - screen.rows)
+
+    def _cell_at(self, runtime, rect, gx, gy):
+        x, y, w, h = rect
+        col = min(max(gx - x - 1, 0), w - 1)
+        row = min(max(gy - y - 1, 0), h - 1)
+        return (self._view_start(runtime) + row, col)
+
+    @staticmethod
+    def _line_at(runtime, line):
+        screen = runtime.screen
+        index = line - (screen.pushed - len(screen.scrollback))
+        if 0 <= index < len(screen.scrollback):
+            return screen.scrollback[index]
+        index -= len(screen.scrollback)
+        if 0 <= index < len(screen.grid):
+            return screen.grid[index]
+        return None
+
+    def _selection_bounds(self):
+        sel = self._select
+        if not sel:
+            return None
+        return tuple(sorted((sel["anchor"], sel["end"])))
+
+    def _selected_spans(self, runtime):
+        """{view row: (first col, last col)} of the selection in a pane."""
+        sel = self._select
+        if not sel or sel["pane"] != runtime.id or \
+                not (sel["moved"] or sel.get("unit")):
+            return None
+        (l0, c0), (l1, c1) = self._selection_bounds()
+        start, spans = self._view_start(runtime), {}
+        for row in range(runtime.screen.rows):
+            line = start + row
+            if l0 <= line <= l1:
+                spans[row] = (c0 if line == l0 else 0,
+                              c1 if line == l1 else 10 ** 6)
+        return spans
+
+    def _selection_text(self, runtime):
+        (l0, c0), (l1, c1) = self._selection_bounds()
+        out = []
+        for line in range(l0, l1 + 1):
+            cells = self._line_at(runtime, line) or []
+            first = c0 if line == l0 else 0
+            last = c1 if line == l1 else len(cells) - 1
+            out.append("".join(cell[0] for cell in cells[first:last + 1])
+                       .rstrip())
+        return "\n".join(out)
+
+    def _expand_unit(self, runtime, line, col, count):
+        """Double click: the word under the cell; triple: the line."""
+        cells = self._line_at(runtime, line) or []
+        if count >= 3:
+            text = "".join(c[0] for c in cells).rstrip()
+            return (line, 0), (line, max(0, len(text) - 1))
+        chars = []
+        for cell in cells:  # a wide char's right half joins its left
+            chars.append(cell[0] if cell[0] else
+                         (chars[-1] if chars else " "))
+        if not chars or col >= len(chars):
+            return (line, col), (line, col)
+        stop = chars[col] in self.WORD_STOP
+        left = right = col
+        while left > 0 and (chars[left - 1] in self.WORD_STOP) == stop:
+            left -= 1
+        while right < len(chars) - 1 and \
+                (chars[right + 1] in self.WORD_STOP) == stop:
+            right += 1
+        return (line, left), (line, right)
+
+    def _select_press(self, runtime, rect, gx, gy):
+        cell = self._cell_at(runtime, rect, gx, gy)
+        now = time.time()
+        last_time, last_cell, count = self._last_press
+        same = last_cell == (runtime.id,) + cell and now - last_time < 0.4
+        count = count + 1 if same else 1
+        self._last_press = (now, (runtime.id,) + cell, count)
+        self._select = {"pane": runtime.id, "anchor": cell, "end": cell,
+                        "active": True, "moved": False}
+        if count >= 2:
+            start, end = self._expand_unit(runtime, cell[0], cell[1],
+                                           count)
+            self._select.update(anchor=start, end=end, unit=True)
+        self._focus_dirty = True
+
+    def _select_drag(self, button, gx, gy, final, rects):
+        sel = self._select
+        runtime = self._runtime(sel["pane"])
+        rect = rects.get(sel["pane"])
+        if runtime is None or rect is None:
+            self._select = None
+            return
+        if button & 64:
+            return  # the wheel mid-drag
+        if final == b"m" or not button & 32:  # released (or a new press)
+            sel["active"] = False
+            if sel["moved"] or sel.get("unit"):
+                text = self._selection_text(runtime)
+                if text.strip():
+                    self._set_clipboard(self._out, text.encode())
+            else:
+                self._select = None  # a plain click selects nothing
+            self._focus_dirty = True
+            return
+        x, y, w, h = rect
+        back = len(runtime.screen.scrollback)
+        # At (or past) the top / bottom row the view scrolls, like tmux:
+        # a terminal never reports a row above the first.
+        if gy - 1 <= y and runtime.view_offset < back:
+            runtime.view_offset += 1
+        elif gy - 1 >= y + h - 1 and runtime.view_offset > 0:
+            runtime.view_offset -= 1
+        end = self._cell_at(runtime, rect, gx, gy)
+        if end != sel["end"] or not sel["moved"]:
+            sel["end"] = end
+            sel["moved"] = sel["moved"] or end != sel["anchor"]
+            self._focus_dirty = True
     _swap_from = None  # pane waiting for the click that picks its partner
 
     def _start_swap(self, pane_id):
@@ -1660,6 +1804,13 @@ class Client(object):
         if self._drag is not None:
             self._drag_divider(button, gx, gy, final)
             return
+        if self._select is not None and self._select["active"]:
+            self._select_drag(button, gx, gy, final, rects)
+            return
+        if self._select is not None and final == b"M" and \
+                not button & 64:
+            self._select = None  # any new click drops the old highlight
+            self._focus_dirty = True
         if self._swap_from is not None:
             if final != b"M" or button & 96:
                 return  # releases, drags and the wheel
@@ -1778,6 +1929,8 @@ class Client(object):
                     self._focus_dirty
             if runtime.screen.mouse_mode:
                 self._forward_mouse(runtime, button, gx - x, gy - y, final)
+            elif final == b"M" and button == 0:
+                self._select_press(runtime, (x, y, w, h), gx, gy)
             return
 
     # Prompts crow itself prints inside a pane, with clickable options:
@@ -2393,6 +2546,8 @@ class Client(object):
         rows.append(("", None))
         rows.append(("  마우스: pane 우클릭 = 분할·확대·닫기·이름 메뉴 · "
                      "경계선 드래그 = 크기 조절", "38;5;245"))
+        rows.append(("  pane 드래그 = 글자 선택·복사 (더블클릭 단어 · 세 번 줄)",
+                     "38;5;245"))
         rows.append(("  하단 탭 클릭 = 윈도우 전환 · + = 새 윈도우 · "
                      "detach / help 도 클릭", "38;5;245"))
         rows.append(("  왼쪽 탭: 세션·호스트 클릭 = 이동 · 세션 우클릭 = "
