@@ -33,6 +33,7 @@ HELP_KEYS = [
     ("←↑↓→ o", "pane 이동 (방향키는 0.5초 안에 연타 가능)"),
     ("z", "pane 확대 / 복원"),
     ("{  }", "pane 자리 바꾸기 (앞 / 뒤 pane과)"),
+    ("!", "pane을 새 윈도우로 떼어내기"),
     ("x", "pane 닫기"),
     ("c", "새 윈도우"),
     ("n  p", "다음 / 이전 윈도우"),
@@ -522,7 +523,7 @@ class Client(object):
     SEAMLESS = ("switch", "switch-session", "split-v", "split-h", "zoom",
                 "new", "open-file", "ssh-connect", "host-disconnect",
                 "new-session", "rename-window", "rename-session",
-                "kill-pane", "kill-session", "kill-window")
+                "kill-pane", "kill-session", "kill-window", "move-pane")
     _term_active = False
     LEAVE = (b"\x1b[r\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l"
              b"\x1b[?2004l\x1b[?1l\x1b[?25h\x1b[?1049l")
@@ -2882,6 +2883,9 @@ class Client(object):
         if not zoomed and len(self.runtimes) > 1:
             items.append({"label": "자리 바꾸기…",
                           "do": lambda: self._start_swap(pane_id)})
+        if self._move_targets(pane_id):
+            items.append({"label": "다른 윈도우로 옮기기…",
+                          "do": lambda: self._move_menu(pane_id)})
         root = self._reverse_root(runtime)
         if root:
             items[:0] = [{"label": "작업 폴더", "do": None, "info": True},
@@ -2898,6 +2902,23 @@ class Client(object):
                   {"label": "pane 닫기…", "danger": True,
                    "do": lambda: self._confirm_kill_pane(pane_id)}]
         self._open_menu(items, gx, gy)
+
+    def _move_targets(self, pane_id):
+        """[(label, window index or None = new window)] a pane can move to."""
+        tabs = self.windows_provider() if self.windows_provider else []
+        targets = [("%d:%s" % (i, name), i)
+                   for i, (name, current) in enumerate(tabs) if not current]
+        if len(self.runtimes) > 1:
+            targets.append(("+ 새 윈도우", None))
+        return targets
+
+    def _move_menu(self, pane_id):
+        items = [{"label": label,
+                  "do": (lambda index=index:
+                         AttachResult("move-pane", (pane_id, index)))}
+                 for label, index in self._move_targets(pane_id)]
+        x, y = self._menu_at
+        self._open_menu(items, x, y, title="어느 윈도우로?")
 
     def _short_path(self, path, limit):
         """~-abbreviated path, its head elided to fit `limit` cells."""
@@ -3463,6 +3484,11 @@ class Client(object):
             return AttachResult("zoom", self.active_id)
         if key in ("{", "}"):
             self._swap_step(-1 if key == "{" else 1)
+            return None
+        if key == "!":
+            if len(self.runtimes) > 1:  # tmux break-pane
+                return AttachResult("move-pane", (self.active_id, None))
+            self._flash("pane이 하나뿐이라 떼어낼 수 없어요")
             return None
         if key == "e":
             self._toggle_explorer()

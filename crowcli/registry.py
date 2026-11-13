@@ -253,6 +253,54 @@ class Registry(object):
         if session["active"] >= len(session["windows"]):
             session["active"] = max(0, len(session["windows"]) - 1)
 
+    def move_pane(self, session, pane_id, target=None, direction="v"):
+        """Move a pane, process and all, to window `target` (split beside
+        its active pane) or, with target None, into a window of its own.
+        The source window goes away when it empties. Returns the
+        destination window, which becomes the session's active one."""
+        source = next((w for w in session["windows"]
+                       if pane_by_id(normalize_window(w), pane_id)), None)
+        if source is None:
+            raise ValueError("no such pane")
+        if target is source:
+            return source
+        pane = pane_by_id(source, pane_id)
+        # Panes without meta of their own read their window's; carry it,
+        # and the daemon socket root, along.
+        meta = dict(pane.get("meta") or source.get("meta") or {})
+        root = (source.get("meta") or {}).get("session_root")
+        if root and not meta.get("session_root"):
+            meta["session_root"] = root
+        pane["meta"] = meta
+        self.remove_pane(source, pane_id)
+        if not source["panes"]:
+            self.remove_window(session, source["id"])
+        if target is None:
+            names = set(w["name"] for w in session["windows"])
+            base = (source.get("meta") or {}).get("provider") or "win"
+            n = len(session["windows"])
+            name = "%s%d" % (base, n) if base == "win" else base
+            while name in names:
+                n += 1
+                name = "%s%d" % (base, n) if base == "win" else \
+                    "%s-%d" % (base, n)
+            target = {"id": str(uuid.uuid4()), "name": name,
+                      "meta": dict(source.get("meta") or {}),
+                      "created_at": time.time(), "panes": [pane],
+                      "active_pane": 0, "layout": leaf(pane["id"])}
+            session["windows"].append(target)
+        else:
+            normalize_window(target)
+            anchor = active_pane(target)
+            target["panes"].append(pane)
+            target["layout"] = split_layout(target["layout"], anchor["id"],
+                                            pane["id"], direction) \
+                if anchor else leaf(pane["id"])
+            target["zoomed"] = None
+            target["active_pane"] = window_panes(target).index(pane)
+        session["active"] = session["windows"].index(target)
+        return target
+
     @staticmethod
     def active_window(session):
         if not session or not session["windows"]:

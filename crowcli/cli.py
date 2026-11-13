@@ -869,6 +869,24 @@ def run_attach(name):
                 except ValueError as error:
                     notice["text"] = "이름 바꾸기 실패: %s" % error
                 continue
+            if result.action == "move-pane":
+                pane_id, index = result.arg
+
+                def move_pane(reg, pane_id=pane_id, index=index):
+                    found = reg.find(name)
+                    if found is None:
+                        return
+                    target = found["windows"][index] \
+                        if index is not None and \
+                        0 <= index < len(found["windows"]) else None
+                    if index is not None and target is None:
+                        return
+                    reg.move_pane(found, pane_id, target)
+                try:
+                    with_registry(move_pane)
+                except (ValueError, KeyError) as error:
+                    notice["text"] = "pane 옮기기 실패: %s" % error
+                continue
             if result.action == "kill-window":
                 index = result.arg
                 found = registry_mod.load_registry().find(name)

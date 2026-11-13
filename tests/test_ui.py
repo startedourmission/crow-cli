@@ -166,6 +166,23 @@ class UiTests(unittest.TestCase):
         out = self.attach([(b"", 1.5), (b"\x02d", 1.0)])
         self.assertIn(b"DRAWN", out)
 
+    def test_prefix_bang_breaks_pane_into_new_window(self):
+        self.cli("new", "-d", "-s", "demo", "-c", self.ws.name)
+        self.cli("split-window", "-t", "demo", "-c", self.ws.name)
+        before = json.loads((Path(self.home.name) / "state.json")
+                            .read_text())["sessions"][0]["windows"][0]
+        self.attach([(b"\x02!", 1.5), (b"echo MOVED-OK\r", 1.0),
+                     (b"\x02d", 1.0)])
+        session = json.loads((Path(self.home.name) / "state.json")
+                             .read_text())["sessions"][0]
+        self.assertEqual([len(w["panes"]) for w in session["windows"]],
+                         [1, 1])
+        self.assertEqual(session["active"], 1)
+        moved = session["windows"][1]["panes"][0]["id"]
+        self.assertIn(moved, [p["id"] for p in before["panes"]])
+        # same process, still alive, now in the new window
+        self.assertIn("MOVED-OK", self.cli("capture", "-t", "demo:1").stdout)
+
     def test_prefix_x_closes_pane_after_in_ui_confirm(self):
         self.cli("new", "-d", "-s", "demo", "-c", self.ws.name)
         self.cli("split-window", "-t", "demo", "-c", self.ws.name)
@@ -1164,6 +1181,26 @@ class MouseMenuTests(unittest.TestCase):
         self.assertEqual(self.saved_layouts[-1][1]["a"], {"leaf": "p2"})
         self.assertEqual(self.client._rects()["p2"][0], x1)  # now on the left
         self.assertEqual(self.sent, [])  # the pick click isn't forwarded
+
+    def test_move_pane_to_other_window_or_new_one(self):
+        self.client.windows_provider = lambda: [("main", True),
+                                                ("logs", False)]
+        rects = self.client._rects()
+        x, y, _w, _h = rects["p2"]
+        self.press(("\x1b[<2;%d;%dM" % (x + 3, y + 3)).encode(), rects=rects)
+        self.click_menu("다른 윈도우로 옮기기…", rects)
+        self.assertEqual([i["label"] for i in self.client.menu["items"]],
+                         ["1:logs", "+ 새 윈도우"])
+        result = self.click_menu("1:logs", rects)
+        self.assertEqual((result.action, result.arg),
+                         ("move-pane", ("p2", 1)))
+        result = self.press(b"\x02", b"!")
+        self.assertEqual((result.action, result.arg),
+                         ("move-pane", ("p2", None)))
+        self.client.runtimes = self.client.runtimes[:1]
+        self.client.active_id = "p1"
+        self.assertIsNone(self.press(b"\x02", b"!"))  # one pane: stays
+        self.assertIn("하나뿐", self.client._paste_msg[0])
 
     def test_swap_mode_cancels_on_escape_and_prefix_braces_swap(self):
         self.client._start_swap("p1")

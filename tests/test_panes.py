@@ -34,6 +34,51 @@ class LayoutTests(unittest.TestCase):
         self.assertEqual(widths, 80)
 
 
+class MovePaneTests(unittest.TestCase):
+    def make(self):
+        from crowcli import registry
+        reg = registry.Registry()
+        session = reg.create_session("s")
+        w0 = reg.add_window(session, cwd="/tmp",
+                            meta={"session_root": "/sock"})
+        first = registry.active_pane(w0)
+        first["meta"] = {}  # an old-style pane reading its window's meta
+        second = reg.add_pane(w0, cwd="/tmp", direction="v",
+                              target_id=first["id"])
+        w1 = reg.add_window(session, cwd="/tmp")
+        return registry, reg, session, w0, w1, first, second
+
+    def test_move_into_other_window_splits_beside_active(self):
+        registry, reg, session, w0, w1, first, second = self.make()
+        moved = reg.move_pane(session, first["id"], w1)
+        self.assertIs(moved, w1)
+        self.assertEqual(session["active"], 1)
+        ids = registry.layout_pane_ids(w1["layout"])
+        self.assertEqual(ids[-1], first["id"])
+        self.assertEqual(len(ids), 2)
+        self.assertEqual(registry.active_pane(w1)["id"], first["id"])
+        self.assertEqual(first["meta"]["session_root"], "/sock")
+        self.assertEqual(registry.layout_pane_ids(w0["layout"]),
+                         [second["id"]])
+
+    def test_last_pane_moving_out_removes_its_window(self):
+        registry, reg, session, w0, w1, first, second = self.make()
+        reg.move_pane(session, first["id"], w1)
+        reg.move_pane(session, second["id"], w1)
+        self.assertEqual(session["windows"], [w1])
+        self.assertEqual(session["active"], 0)
+        self.assertEqual(len(w1["panes"]), 3)
+
+    def test_break_into_new_window(self):
+        registry, reg, session, w0, w1, first, second = self.make()
+        moved = reg.move_pane(session, second["id"])
+        self.assertEqual(moved["layout"], {"leaf": second["id"]})
+        self.assertEqual(session["windows"][-1], moved)
+        self.assertEqual(session["active"], 2)
+        self.assertNotIn(moved["name"], (w0["name"], w1["name"]))
+        self.assertEqual(moved["meta"].get("session_root"), "/sock")
+
+
 class VtTests(unittest.TestCase):
     def text(self, screen, row=0):
         return "".join(cell[0] for cell in screen.grid[row]).rstrip()
