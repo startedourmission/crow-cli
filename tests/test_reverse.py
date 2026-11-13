@@ -448,3 +448,129 @@ class RemoteForwardTests(unittest.TestCase):
             gone.terminate.assert_called_once()
             self.assertNotIn(("pane", "p2"), forwards)
             self.assertEqual(len(procs), 4)
+
+
+class McpEndToEndTests(unittest.TestCase):
+    """The agent's view: JSON-RPC over the real proxy → bridge → tools,
+    every crow_client tool on its happy path and at its edges."""
+
+    def setUp(self):
+        self.ws = tempfile.TemporaryDirectory(prefix="ccw-", dir="/tmp")
+        self.outside = tempfile.TemporaryDirectory(prefix="cco-", dir="/tmp")
+        self.root = os.path.realpath(self.ws.name)
+        Path(self.outside.name, "secret.txt").write_text("SECRET")
+        os.symlink(self.outside.name, os.path.join(self.root, "link"))
+        self.token = "t" * 32
+        self.bridge = subprocess.Popen(
+            [sys.executable, CROW, "agent-bridge", "--root", self.root,
+             "--token", self.token], stdout=subprocess.PIPE, text=True)
+        self.port = json.loads(self.bridge.stdout.readline())["port"]
+        self.proxy = self.start_proxy(self.port, self.token)
+        self.next_id = 0
+
+    def tearDown(self):
+        for proc in (self.proxy, self.bridge):
+            proc.kill()
+            proc.wait()
+            for stream in (proc.stdin, proc.stdout):
+                if stream:
+                    stream.close()
+        self.ws.cleanup()
+        self.outside.cleanup()
+
+    def start_proxy(self, port, token):
+        return subprocess.Popen(
+            [sys.executable, CROW, "agent-proxy", json.dumps(
+                {"host": "127.0.0.1", "port": port, "token": token})],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+
+    def rpc(self, method, params=None, proxy=None):
+        proxy = proxy or self.proxy
+        self.next_id += 1
+        proxy.stdin.write(json.dumps({"jsonrpc": "2.0", "id": self.next_id,
+                                      "method": method,
+                                      "params": params or {}}) + "\n")
+        proxy.stdin.flush()
+        return json.loads(proxy.stdout.readline())
+
+    def call(self, name, **arguments):
+        response = self.rpc("tools/call", {"name": name,
+                                           "arguments": arguments})
+        result = response["result"]
+        text = result["content"][0]["text"]
+        if result.get("isError"):
+            return None, text
+        return json.loads(text), None
+
+    def test_handshake_lists_the_six_tools(self):
+        init = self.rpc("initialize", {"protocolVersion": "2024-11-05"})
+        self.assertEqual(init["result"]["serverInfo"]["name"], "crow-client")
+        names = [t["name"] for t in self.rpc("tools/list")["result"]["tools"]]
+        self.assertEqual(names, ["workspace_info", "list_directory",
+                                 "read_file", "write_file", "edit_file",
+                                 "shell"])
+        self.assertIn("error", self.rpc("no/such/method"))
+        _value, error = self.call("rm_rf")
+        self.assertIn("Unknown", error)
+
+    def test_files_stay_inside_the_workspace(self):
+        info, _ = self.call("workspace_info")
+        self.assertEqual(info["root"], self.root)
+        written, _ = self.call("write_file", path="d/e/새 파일.txt",
+                               text="한글\n")
+        self.assertTrue(written["written"])
+        read, _ = self.call("read_file", path="d/e/새 파일.txt")
+        self.assertEqual(read["text"], "한글\n")
+        listing, _ = self.call("list_directory", path="d")
+        self.assertEqual(listing, [{"name": "e", "directory": True}])
+        for path in ("../x", "/etc/hosts", "link/secret.txt",
+                     self.outside.name + "/secret.txt"):
+            value, error = self.call("read_file", path=path)
+            self.assertIsNone(value, path)
+            self.assertIn("outside", error, path)
+        _value, error = self.call("write_file", path="link/new.txt",
+                                  text="x")
+        self.assertIn("outside", error)
+        self.assertFalse(os.path.exists(
+            os.path.join(self.outside.name, "new.txt")))
+
+    def test_write_and_edit_refuse_ambiguity(self):
+        self.call("write_file", path="a.txt", text="one one")
+        _value, error = self.call("write_file", path="a.txt", text="x")
+        self.assertIn("exists", error)
+        _value, error = self.call("edit_file", path="a.txt",
+                                  old_text="one", new_text="two")
+        self.assertIn("exactly once", error)
+        self.call("edit_file", path="a.txt", old_text="one one",
+                  new_text="two")
+        self.assertEqual(Path(self.root, "a.txt").read_text(), "two")
+
+    def test_big_and_binary_files(self):
+        Path(self.root, "big.txt").write_text("x" * 250000)
+        read, _ = self.call("read_file", path="big.txt")
+        self.assertEqual((len(read["text"]), read["truncated"]),
+                         (200000, True))
+        Path(self.root, "bin").write_bytes(b"\xff\xfe\x00")
+        value, error = self.call("read_file", path="bin")
+        self.assertIsNone(value)
+        self.assertTrue(error)
+
+    def test_shell_runs_on_the_client_in_the_workspace(self):
+        done, _ = self.call("shell", command="pwd; echo 한글; exit 3")
+        self.assertEqual(done["exit_code"], 3)
+        self.assertEqual(done["output"].splitlines(), [self.root, "한글"])
+        _value, error = self.call("shell", command="pwd",
+                                  cwd=self.outside.name)
+        self.assertIn("outside", error)
+        _value, error = self.call("shell", command="sleep 5", timeout=1)
+        self.assertIn("time", error)
+
+    def test_bridge_refuses_a_wrong_token(self):
+        import socket
+        sock = socket.create_connection(("127.0.0.1", self.port))
+        sock.sendall(b'{"crow_bridge_token": "wrong"}\n')
+        sock.settimeout(3)
+        self.assertEqual(sock.recv(100), b"")  # closed without a reply
+        sock.close()
+        info, _ = self.call("workspace_info")  # the real proxy still works
+        self.assertEqual(info["root"], self.root)
