@@ -7,9 +7,11 @@ the window's split layout. The child PTYs never see the real terminal
 size — they get their pane rectangle — so full-screen agent TUIs stay
 inside their pane and the borders/status bar are never overwritten.
 """
+import base64
 import os
 import re
 import select
+import shutil
 import signal
 import socket
 import struct
@@ -166,8 +168,10 @@ class PaneRuntime(object):
                 if self.awaiting_replay and payload != b"\x1bc":
                     self.awaiting_replay = False
                     self.screen.feed_replay(payload)
-                    # queries in old output were answered back then
+                    # queries in old output were answered back then, and
+                    # old copies must not overwrite today's clipboard
                     self.screen.responses = []
+                    self.screen.clipboard = []
                 else:
                     self.screen.feed(payload)
                 changed = True
@@ -431,6 +435,7 @@ class Client(object):
             parked = PANE_CACHE.take(pane["id"])
             if parked is not None:
                 runtime.conn, runtime.screen = parked.conn, parked.screen
+                runtime.screen.clipboard = []  # copied while off screen
                 runtime.awaiting_replay = parked.awaiting_replay
                 runtime.cached = True
             self.runtimes.append(runtime)
@@ -1316,6 +1321,9 @@ class Client(object):
                 runtime.conn.feed(data)
                 fed, code = runtime.consume()
                 changed = changed or fed
+                if runtime.screen.clipboard:
+                    self._set_clipboard(out, runtime.screen.clipboard[-1])
+                    runtime.screen.clipboard = []
                 if code is not None:
                     return AttachResult("dead", (runtime.id, code))
             if changed:
@@ -1511,6 +1519,40 @@ class Client(object):
 
         threading.Thread(target=work, daemon=True).start()
         return True
+
+    @staticmethod
+    def _clipboard_mode():
+        """"pbcopy" when crow runs on the Mac whose clipboard is wanted,
+        else "osc52": the outer terminal sets its own (local) clipboard,
+        which is the only way through ssh. CROWCLI_CLIPBOARD overrides."""
+        forced = os.environ.get("CROWCLI_CLIPBOARD")
+        if forced in ("pbcopy", "osc52", "off"):
+            return forced
+        remote = os.environ.get("SSH_TTY") or os.environ.get("SSH_CONNECTION")
+        if sys.platform == "darwin" and not remote and shutil.which("pbcopy"):
+            return "pbcopy"
+        return "osc52"
+
+    def _set_clipboard(self, out, data):
+        """A pane app asked to copy `data` (OSC 52): put it on the
+        clipboard of the person at the keyboard."""
+        mode = self._clipboard_mode()
+        if mode == "off" or not data:
+            return
+        if mode == "pbcopy":
+            def run():
+                try:
+                    subprocess.run(["pbcopy"], input=data, timeout=5,
+                                   stdout=subprocess.DEVNULL,
+                                   stderr=subprocess.DEVNULL)
+                except (OSError, subprocess.SubprocessError):
+                    pass
+            threading.Thread(target=run, daemon=True).start()
+        else:
+            out.write(b"\x1b]52;c;" + base64.b64encode(data) + b"\x07")
+            out.flush()
+        chars = len(data.decode("utf-8", "replace"))
+        self._flash("클립보드에 복사됨 (%d자)" % chars, seconds=2)
 
     def _flash(self, text, seconds=4):
         self._paste_msg = (text, time.time() + seconds)
@@ -2959,8 +3001,32 @@ class Client(object):
         self._menu_confirm("%s 닫을까요?" % name, "닫기 (프로그램 종료)",
                            lambda: AttachResult("kill-pane", (pane_id, True)))
 
+    def _session_where_rows(self, name):
+        """Info rows naming where a session runs (reverse / ssh)."""
+        info = next((s for s in (self._sidebar_data or {}).get("sessions")
+                     or [] if s.get("name") == name), {})
+        if "host" not in info:
+            return []
+        host = info["host"]
+        if host is None:
+            label = "이 컴퓨터 (로컬 샌드박스)"
+        elif host[1] and host[0] != host[1]:
+            label = "%s — %s" % (host[0], host[1])
+        else:
+            label = host[0] or "?"
+        rows = [{"label": "호스트  " + self._short_path(label, 36),
+                 "do": None, "info": True}]
+        if info.get("provider"):
+            rows.append({"label": "에이전트  " + info["provider"],
+                         "do": None, "info": True})
+        if info.get("folder"):
+            rows.append({"label": "폴더  " + self._short_path(info["folder"],
+                                                            36),
+                         "do": None, "info": True})
+        return rows + [self.MENU_SEP]
+
     def _session_menu(self, name, current, gx, gy):
-        items = []
+        items = self._session_where_rows(name)
         if not current:
             items.append({"label": "이 세션으로 이동",
                           "do": lambda: AttachResult("switch-session",

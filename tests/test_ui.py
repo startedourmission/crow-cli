@@ -183,6 +183,18 @@ class UiTests(unittest.TestCase):
         # same process, still alive, now in the new window
         self.assertIn("MOVED-OK", self.cli("capture", "-t", "demo:1").stdout)
 
+    def test_remote_style_copy_reaches_outer_terminal_once(self):
+        import base64
+        self.env["CROWCLI_CLIPBOARD"] = "osc52"  # never touch the real one
+        self.cli("new", "-d", "-s", "demo", "-c", self.ws.name)
+        payload = base64.b64encode("원격 복사 OK".encode())
+        out = self.attach([
+            (b"printf '\\033]52;c;%s\\007' " + payload + b"\r", 1.5),
+            (b"\x02d", 1.0)])
+        self.assertIn(b"\x1b]52;c;" + payload + b"\x07", out)
+        again = self.attach([(b"\x02d", 1.0)])  # replay holds it: not resent
+        self.assertNotIn(b"\x1b]52;", again)
+
     def test_prefix_x_closes_pane_after_in_ui_confirm(self):
         self.cli("new", "-d", "-s", "demo", "-c", self.ws.name)
         self.cli("split-window", "-t", "demo", "-c", self.ws.name)
@@ -1097,6 +1109,33 @@ class MouseMenuTests(unittest.TestCase):
         self.assertEqual((result.action, result.arg),
                          ("kill-session", "work"))
 
+    def test_session_menu_shows_where_it_runs(self):
+        home = os.path.expanduser("~")
+        self.client.sidebar_data_provider = lambda: {"sessions": [
+            {"name": "main", "current": True},
+            {"name": "reverse-claude", "host": ("mac", "me@10.0.0.5"),
+             "provider": "claude", "folder": home + "/proj"},
+            {"name": "reverse-codex", "host": None, "provider": "codex",
+             "folder": "/tmp/w"},
+            {"name": "ssh-box", "host": ("10.0.0.9", "10.0.0.9")}],
+            "hosts": [], "keys": []}
+        self.client._sidebar_at = 0.0
+        self.client._refresh_sidebar()
+
+        def labels(name):
+            self.client._session_menu(name, False, 3, 3)
+            items = self.client.menu["items"]
+            self.assertEqual(items[self.client.menu["sel"]]["label"],
+                             "이 세션으로 이동")  # info rows aren't picked
+            return [i["label"] for i in items if i.get("info")]
+        self.assertEqual(labels("reverse-claude"),
+                         ["호스트  mac — me@10.0.0.5", "에이전트  claude",
+                          "폴더  ~/proj"])
+        self.assertEqual(labels("reverse-codex")[0],
+                         "호스트  이 컴퓨터 (로컬 샌드박스)")
+        self.assertEqual(labels("ssh-box"), ["호스트  10.0.0.9"])
+        self.assertEqual(labels("main"), [])
+
     def test_sidebar_keys_d_and_e_on_sessions(self):
         self.press(b"\x02", b"h")
         for _ in range(3):  # add-host → + 새 세션 → work
@@ -1214,6 +1253,39 @@ class MouseMenuTests(unittest.TestCase):
         self.press(b"\x02", b"{")
         self.assertEqual(self.client._window["layout"]["a"], {"leaf": "p1"})
         self.assertEqual(len(self.saved_layouts), 2)
+
+    def test_pane_copy_goes_to_clipboard(self):
+        import base64
+        from unittest import mock
+        from crowcli import client as client_mod
+
+        class Out(object):
+            data = b""
+
+            def write(self, chunk):
+                Out.data += chunk
+
+            def flush(self):
+                pass
+        with mock.patch.dict(os.environ, CROWCLI_CLIPBOARD="osc52"):
+            self.client._set_clipboard(Out(), "복사".encode())
+        self.assertEqual(Out.data, b"\x1b]52;c;"
+                         + base64.b64encode("복사".encode()) + b"\x07")
+        self.assertIn("2자", self.client._paste_msg[0])
+        calls = []
+        with mock.patch.dict(os.environ, CROWCLI_CLIPBOARD="pbcopy"), \
+                mock.patch.object(client_mod.subprocess, "run",
+                                  lambda args, **kw: calls.append(
+                                      (args, kw["input"]))), \
+                mock.patch.object(client_mod.threading, "Thread",
+                                  lambda target, daemon: mock.Mock(
+                                      start=target)):
+            Out.data = b""
+            self.client._set_clipboard(Out(), b"hi")
+        self.assertEqual(calls, [(["pbcopy"], b"hi")])
+        self.assertEqual(Out.data, b"")
+        with mock.patch.dict(os.environ, CROWCLI_CLIPBOARD="", SSH_TTY="/x"):
+            self.assertEqual(self.client._clipboard_mode(), "osc52")
 
     def test_blank_pane_nudge_resizes_then_restores(self):
         sizes = []

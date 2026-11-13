@@ -408,6 +408,26 @@ def image_target(pane_meta, window_meta):
                                          + args[1:], data)
 
 
+def session_where(session, meta):
+    """Where a session runs, for its menu: {"host": (name, address) or
+    None for this computer, "provider", "folder"} (keys only when known)."""
+    first = session["windows"][0].get("meta", {}) if session["windows"] \
+        else {}
+    kind = session["kind"]
+    where = {}
+    if kind.startswith("reverse"):
+        where["provider"] = meta.get("provider") or first.get("provider")
+        where["folder"] = meta.get("client_root") or first.get("client_root")
+        address = meta.get("remote_host") or first.get("remote_host")
+        name = meta.get("remote_host_name") or first.get("remote_host_name")
+        where["host"] = (name or address, address) if address else None
+    elif kind == "ssh":
+        address = first.get("ssh_host")
+        name = first.get("ssh_host_name")
+        where["host"] = (name or address, address) if address else None
+    return dict((k, v) for k, v in where.items() if v or k == "host")
+
+
 def run_attach(name):
     forwards = {}
     remote_drops = 0
@@ -493,10 +513,10 @@ def run_attach(name):
                             status = "브리지 끊김"
                     else:
                         status = "실행 중" if alive else "종료"
-                    sessions.append({
-                        "name": item["name"], "kind": item["kind"],
-                        "status": status,
-                        "current": item["name"] == current})
+                    sessions.append(dict(
+                        session_where(item, meta),
+                        name=item["name"], kind=item["kind"],
+                        status=status, current=item["name"] == current))
                 hosts = []
                 for host in fresh.data.get("hosts", []):
                     ssh_name = ssh_session_name(host)

@@ -80,6 +80,19 @@ class MovePaneTests(unittest.TestCase):
 
 
 class VtTests(unittest.TestCase):
+    def test_osc52_copy_is_collected_and_queries_ignored(self):
+        import base64
+        screen = Screen(40, 5)
+        text = ("한글 copy " * 300).encode()  # far past the 256-char OSC cap
+        screen.feed(b"a\x1b]52;c;" + base64.b64encode(text) + b"\x07b"
+                    + b"\x1b]52;c;?\x1b\\" + b"\x1b]52;c;!!bad\x07c")
+        self.assertEqual(screen.clipboard, [text])
+        self.assertEqual("".join(c[0] for c in screen.grid[0]).rstrip(),
+                         "abc")
+        screen.feed(b"\x1b]52;c;" + base64.b64encode(b"x"))  # split write
+        screen.feed(b"\x1b\\")
+        self.assertEqual(screen.clipboard[-1], b"x")
+
     def text(self, screen, row=0):
         return "".join(cell[0] for cell in screen.grid[row]).rstrip()
 

@@ -143,6 +143,22 @@ class ReverseLocalTests(unittest.TestCase):
         refused = self.cli("split-window", "-t", "rag", "--", "vi")
         self.assertNotEqual(refused.returncode, 0)
 
+    def test_session_where_names_host_agent_and_folder(self):
+        from crowcli.cli import session_where
+        remote = {"kind": "reverse-agent", "windows": [{"meta": {
+            "provider": "claude", "client_root": "/w",
+            "remote_host": "me@h", "remote_host_name": "mac"}}]}
+        self.assertEqual(session_where(remote, {}),
+                         {"provider": "claude", "folder": "/w",
+                          "host": ("mac", "me@h")})
+        local = {"kind": "reverse-agent-local", "windows": [{"meta": {
+            "provider": "fake", "client_root": "/w"}}]}
+        self.assertIsNone(session_where(local, {})["host"])
+        ssh = {"kind": "ssh", "windows": [{"meta": {"ssh_host": "u@b"}}]}
+        self.assertEqual(session_where(ssh, {}), {"host": ("u@b", "u@b")})
+        self.assertEqual(session_where({"kind": "local", "windows": []}, {}),
+                         {})
+
     def test_change_folder_restarts_agent_in_new_folder(self):
         from unittest import mock
         from crowcli import cli, registry

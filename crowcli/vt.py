@@ -7,6 +7,8 @@ truecolour), wide/combining characters, mouse/bracketed-paste mode
 tracking, and DSR/DA replies. Each pane owns one Screen; the attach
 renderer composites the grids.
 """
+import base64
+import binascii
 import codecs
 import functools
 import re
@@ -37,6 +39,9 @@ _FAST = re.compile(r"[\x20-\x7e]+|\x1b\[([\x30-\x3f]*[\x20-\x2f]*)([\x40-\x7e])"
 _ALT_SWITCH = re.compile(rb"\x1b\[\?(?:1049|1047|47)([hl])")
 _MODES = re.compile(rb"\x1b\[\?[\d;]*[hl]|\x1b[=>]|\x1b\[\d*(?:;\d*)?r")
 REPLAY_SKIP_MIN = 256 * 1024
+# OSC 52 (set clipboard) carries base64 text; other OSCs stay short.
+OSC_MAX = 256
+OSC52_MAX = 4 * 1024 * 1024
 
 
 class Screen(object):
@@ -52,6 +57,11 @@ class Screen(object):
         self.csi = ""
         self.osc = False  # the escape-string body being read is an OSC
         self.osc_buf = ""
+        self.osc_extra = []  # the rest of a long OSC 52 body
+        self.osc_extra_len = 0
+        # Text the app asked to put on the clipboard (OSC 52), for the
+        # client to pass on; old requests in a replay are dropped.
+        self.clipboard = []
         self.esc_intermediate = ""
         self.grid = [self._line() for _ in range(self.rows)]
         self.scrollback = []
@@ -192,8 +202,12 @@ class Screen(object):
                 self._osc_end("\x07")
             elif char == "\x1b":
                 self.state = "esc_string"
-            elif len(self.osc_buf) < 256:
+            elif len(self.osc_buf) < OSC_MAX:
                 self.osc_buf += char
+            elif self.osc_buf.startswith("52;") and \
+                    self.osc_extra_len < OSC52_MAX:
+                self.osc_extra.append(char)
+                self.osc_extra_len += 1
             return
         if self.state == "esc_string":  # string terminator after ESC
             if char == "\\":
@@ -217,7 +231,7 @@ class Screen(object):
         elif char in ("\x90", "\x98", "\x9e", "\x9f"):
             self.state, self.osc = "string", False
         elif char == "\x9d":
-            self.state, self.osc, self.osc_buf = "osc", True, ""
+            self._osc_start()
         elif char == "\r":
             self.cx = 0
             self.wrap_pending = False
@@ -237,9 +251,25 @@ class Screen(object):
         else:
             self._print(char)
 
+    def _osc_start(self):
+        self.state, self.osc, self.osc_buf = "osc", True, ""
+        self.osc_extra, self.osc_extra_len = [], 0
+
     def _osc_end(self, terminator):
-        code, _, value = self.osc_buf.partition(";")
-        self.osc_buf = ""
+        body = self.osc_buf + "".join(self.osc_extra)
+        self.osc_buf, self.osc_extra, self.osc_extra_len = "", [], 0
+        code, _, value = body.partition(";")
+        if code == "52":
+            # 52;<targets>;<base64> sets the clipboard; "?" asks to read
+            # it, which is never answered (a pane must not read it).
+            _targets, _, data = value.partition(";")
+            if data and data != "?":
+                try:
+                    text = base64.b64decode(data.strip())
+                except (binascii.Error, ValueError):
+                    return
+                self.clipboard.append(text)
+            return
         # Default fg/bg queries: TUIs (Cursor Agent, Codex...) pick a
         # light or dark theme from these, so answer with the outer
         # terminal's real colours when the client could learn them.
@@ -262,7 +292,7 @@ class Screen(object):
             self.state = "csi"
             self.csi = ""
         elif char == "]":
-            self.state, self.osc, self.osc_buf = "osc", True, ""
+            self._osc_start()
         elif char in "PX^_":
             self.state, self.osc = "string", False
         elif char == "c":
