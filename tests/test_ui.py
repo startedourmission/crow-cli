@@ -261,6 +261,20 @@ class UiTests(unittest.TestCase):
         self.assertIn(b"back", out)
         self.assertIn(b"\x1b[?1000l", out)
 
+    def test_double_click_copies_a_word_from_a_shell_pane(self):
+        import base64
+        self.env["CROWCLI_CLIPBOARD"] = "osc52"  # never touch the real one
+        self.cli("new", "-d", "-s", "demo", "-c", self.ws.name)
+        pane_col = 28 + 1 + 2  # sidebar 27 + divider, then 2 cells in
+        click = ("\x1b[<0;%d;1M\x1b[<0;%d;1m" % (pane_col, pane_col)) \
+            .encode()
+        out = self.attach([
+            (b"printf '\\033[2J\\033[HSELECT-ME-42 tail\\n'\r", 1.0),
+            (click, 0.1), (click, 1.0),
+            (b"\x02d", 1.0)])
+        self.assertIn(b"\x1b]52;c;" + base64.b64encode(b"SELECT-ME-42")
+                      + b"\x07", out)
+
     def test_saved_hosts_crud(self):
         self.cli("host", "add", "mac", "--address", "me@10.0.0.5",
                  "--port", "2222")
@@ -1433,6 +1447,116 @@ class MouseMenuTests(unittest.TestCase):
 def json_copy(value):
     import json
     return json.loads(json.dumps(value))
+
+
+class PaneSelectTests(unittest.TestCase):
+    """Drag / double / triple click selects text in a pane whose app
+    doesn't use the mouse, and copies it."""
+
+    def setUp(self):
+        from unittest import mock
+        from crowcli import imswitch
+        from crowcli.client import Client, PaneRuntime
+        patcher = mock.patch.multiple(imswitch, to_latin=lambda: None,
+                                      restore=lambda _id: None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        client = Client(object())
+        client._winsize = lambda: (100, 30)
+        client._window = {"id": "w", "name": "main", "meta": {},
+                          "active_pane": 0, "layout": {"leaf": "p"},
+                          "panes": [{"id": "p", "name": "pane0",
+                                     "meta": {}}]}
+        runtime = PaneRuntime(client._window["panes"][0], client._window)
+        client.runtimes, client.active_id = [runtime], "p"
+        self.rects = client._rects()
+        x, y, w, h = self.rects["p"]
+        runtime.screen.resize(w, h)
+        self.copied = []
+        client._set_clipboard = lambda out, data: self.copied.append(
+            data.decode())
+        self.client, self.runtime, self.x, self.y = client, runtime, x, y
+
+    def mouse(self, button, col, row, final=b"M"):
+        """col/row: 0-based pane cell."""
+        self.client._input(("\x1b[<%d;%d;%d" % (
+            button, self.x + col + 1, self.y + row + 1)).encode() + final,
+            self.rects)
+
+    def test_drag_selects_across_lines_and_copies(self):
+        self.runtime.screen.feed(b"first line here\r\nsecond line\r\n")
+        self.mouse(0, 6, 0)
+        self.mouse(32, 9, 1)
+        spans = self.client._selected_spans(self.runtime)
+        self.assertEqual(spans[0][0], 6)
+        self.assertEqual(spans[1], (0, 9))
+        self.mouse(0, 9, 1, b"m")
+        self.assertEqual(self.copied, ["line here\nsecond lin"])
+        self.assertIsNotNone(self.client._select)  # stays highlighted
+        self.client._input(b"x", self.rects)
+        self.assertIsNone(self.client._select)  # typing clears it
+
+    def test_double_click_word_and_triple_click_line(self):
+        self.runtime.screen.feed(b"open ~/dev/a.txt (now)\r\n")
+        for _ in range(2):
+            self.mouse(0, 8, 0)
+            self.mouse(0, 8, 0, b"m")
+        self.assertEqual(self.copied, ["~/dev/a.txt"])
+        self.mouse(0, 8, 0)
+        self.mouse(0, 8, 0, b"m")
+        self.assertEqual(self.copied[-1], "open ~/dev/a.txt (now)")
+
+    def test_plain_click_selects_nothing(self):
+        self.runtime.screen.feed(b"hello\r\n")
+        self.mouse(0, 1, 0)
+        self.mouse(0, 1, 0, b"m")
+        self.assertEqual(self.copied, [])
+        self.assertIsNone(self.client._select)
+
+    def test_apps_using_the_mouse_get_the_drag_instead(self):
+        sent = []
+
+        class Conn(object):
+            def send(self, kind, data):
+                sent.append(data)
+        self.runtime.conn = Conn()
+        self.runtime.screen.feed(b"\x1b[?1000h\x1b[?1006hTUI")
+        self.mouse(0, 1, 0)
+        self.mouse(32, 3, 0)
+        self.mouse(0, 3, 0, b"m")
+        self.assertIsNone(self.client._select)
+        self.assertEqual(len(sent), 3)
+        self.assertEqual(self.copied, [])
+
+    def test_drag_past_the_top_scrolls_into_history(self):
+        for i in range(60):
+            self.runtime.screen.feed(("row %02d\r\n" % i).encode())
+        self.mouse(0, 0, 1)
+        for _ in range(5):
+            self.mouse(32, 0, 0)  # held on the top row
+        self.assertEqual(self.runtime.view_offset, 5)
+        self.mouse(0, 0, 0, b"m")
+        lines = self.copied[0].splitlines()
+        self.assertEqual(len(lines), 7)  # row 1 up through 5 scrolled rows
+        numbers = [int(l.split()[1]) for l in lines[:-1]]
+        self.assertEqual(numbers, list(range(numbers[0], numbers[0] + 6)))
+        self.assertEqual(lines[-1], "r")  # up to the anchor cell (col 0)
+
+    def test_selection_is_drawn_reversed(self):
+        self.runtime.screen.feed(b"abcdef")
+        self.mouse(0, 1, 0)
+        self.mouse(32, 3, 0)
+
+        class Out(object):
+            data = b""
+
+            def write(self, chunk):
+                Out.data += chunk
+
+            def flush(self):
+                pass
+        self.client._render(Out(), self.rects, force=True)
+        self.assertIn(b"a\x1b[0;7mbcd\x1b[0mef", Out.data)
 
 
 class ImagePasteTests(unittest.TestCase):
