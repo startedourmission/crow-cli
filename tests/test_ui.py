@@ -1326,6 +1326,63 @@ class MouseMenuTests(unittest.TestCase):
         with mock.patch.dict(os.environ, CROWCLI_CLIPBOARD="", SSH_TTY="/x"):
             self.assertEqual(self.client._clipboard_mode(), "osc52")
 
+    def test_reverse_panel_resumes_an_earlier_conversation(self):
+        import threading as threading_mod
+        client = self.client
+        calls, gate = [], threading_mod.Event()
+
+        def history(provider, root, host_ref=None, local=False):
+            calls.append((provider, root, host_ref["name"], local))
+            gate.wait(5)
+            return [{"id": "s1", "title": "로그인 버그", "updated":
+                     time.time() - 7200}]
+        client.history_provider = history
+        client.explorer_root_provider = lambda _pane: "/tmp/proj"
+        client._toggle_reverse = lambda: setattr(
+            client, "reverse_open", not client.reverse_open)
+        client._open_reverse_for_host({"name": "mac", "address": "a@b"})
+        client.reverse_stage = "provider"
+        kinds = [r["kind"] for r in client._reverse_rows()]
+        client.reverse_sel = kinds.index("history-open")
+        self.assertIsNone(client._reverse_activate())  # claude's row
+        self.assertEqual(client.reverse_stage, "history")
+        self.assertIn("불러오는 중…",
+                      [r["label"] for r in client._reverse_rows()])
+        gate.set()
+        deadline = time.time() + 5
+        while client._history["items"] is None and time.time() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(calls, [("claude", "/tmp/proj", "mac", False)])
+        rows = client._reverse_rows()
+        self.assertEqual(rows[1]["label"], "2시간 전 · 로그인 버그")
+        client._reverse_chunk()
+        self.assertIn("뒤로", client._reverse_back_label())
+        client.reverse_sel = 1
+        result = client._reverse_activate()
+        self.assertEqual(result.action, "reverse-start")
+        self.assertEqual((result.arg["session_id"], result.arg["provider"],
+                          result.arg["client_root"]),
+                         ("s1", "claude", "/tmp/proj"))
+
+    def test_reverse_history_failure_shows_in_the_panel(self):
+        client = self.client
+
+        def history(provider, root, host_ref=None, local=False):
+            raise ValueError("서버에 물어보지 못했어요")
+        client.history_provider = history
+        client._toggle_reverse = lambda: setattr(
+            client, "reverse_open", not client.reverse_open)
+        client._open_reverse_for_host({"name": "mac", "address": "a@b"})
+        client.reverse_stage = "provider"
+        client._open_history("codex")
+        deadline = time.time() + 5
+        while client._history["error"] is None and time.time() < deadline:
+            time.sleep(0.01)
+        self.assertIn("✗ 서버에 물어보지 못했어요",
+                      [r["label"] for r in client._reverse_rows()])
+        client._reverse_back()
+        self.assertEqual(client.reverse_stage, "provider")
+
     def test_blank_pane_nudge_resizes_then_restores(self):
         sizes = []
 

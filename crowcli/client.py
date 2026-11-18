@@ -282,8 +282,12 @@ class Client(object):
                  explorer_root_provider=None, reverse_data_provider=None,
                  sidebar_data_provider=None, notice_provider=None,
                  windows_provider=None, host_form=None, image_target=None,
-                 key_actions=None, layout_saver=None):
+                 key_actions=None, layout_saver=None, history_provider=None):
         self.hooks = hooks
+        # (provider, client_root, host_ref=, local=) -> [{"id", "title",
+        # "updated"}]: earlier reverse conversations, raising on failure
+        self.history_provider = history_provider
+        self._history = None
         # (window_id, layout tree) -> None: persists a dragged divider
         self.layout_saver = layout_saver
         # {"list": () -> [key dict], "copy": key -> message,
@@ -2120,9 +2124,60 @@ class Client(object):
         self.reverse_sel = 0
         self.reverse_scroll = 0
 
+    def _history_rows(self):
+        history = self._history or {}
+        rows = [{"kind": "info", "label": "폴더  " + self._short_path(
+            history.get("root", ""), 30)}]
+        if history.get("error"):
+            return rows + [{"kind": "info",
+                            "label": "✗ " + history["error"]}]
+        items = history.get("items")
+        if items is None:
+            return rows + [{"kind": "info", "label": "불러오는 중…"}]
+        if not items:
+            return rows + [{"kind": "info",
+                            "label": "이 폴더의 지난 대화가 없어요"}]
+        return rows + [{"kind": "history-pick", "id": item["id"],
+                        "label": "%s · %s" % (self._ago(item["updated"]),
+                                              item["title"])}
+                       for item in items]
+
+    @staticmethod
+    def _ago(stamp):
+        seconds = max(0, time.time() - (stamp or 0))
+        if seconds < 60:
+            return "방금"
+        if seconds < 3600:
+            return "%d분 전" % (seconds // 60)
+        if seconds < 86400:
+            return "%d시간 전" % (seconds // 3600)
+        return "%d일 전" % (seconds // 86400)
+
+    def _open_history(self, provider):
+        """List this folder's earlier conversations in the background (a
+        server round trip) and show them as resumable rows."""
+        root = self._active_cwd()
+        history = {"provider": provider, "root": root, "items": None,
+                   "error": None}
+        self._history = history
+        self.reverse_stage = "history"
+        self.reverse_sel = 1
+        host, local = self._pending_host, self._pending_local
+
+        def fetch():
+            try:
+                history["items"] = list(self.history_provider(
+                    provider, root, host_ref=host, local=local))
+            except Exception as error:  # shown in the panel
+                history["error"] = str(error) or error.__class__.__name__
+            self._probe_dirty = True  # repaint from the attach loop
+        threading.Thread(target=fetch, daemon=True).start()
+
     def _reverse_rows(self):
         if self.reverse_stage in self.KEY_STAGES:
             return self._key_rows()
+        if self.reverse_stage == "history":
+            return self._history_rows()
         if self.reverse_stage == "menu" and self._pending_host:
             host = self._pending_host
             state = self._host_status.get(
@@ -2167,6 +2222,11 @@ class Client(object):
             rows.append({"kind": "provider",
                          "label": provider + " 실행",
                          "provider": provider})
+        if self.history_provider and not self._pending_local:
+            rows.append({"kind": "info", "label": ""})
+            for provider in ("claude", "codex"):
+                rows.append({"kind": "history-open", "provider": provider,
+                             "label": "↺ %s 이전 대화 이어가기…" % provider})
         return rows
 
     def _active_cwd(self):
@@ -2178,7 +2238,8 @@ class Client(object):
                 root = None
         if not root:
             active = self._active()
-            root = active.pane.get("cwd") if active else os.getcwd()
+            root = (active.pane.get("cwd") if active else None) \
+                or os.getcwd()
         return root
 
     def _reverse_activate(self):
@@ -2230,6 +2291,15 @@ class Client(object):
             return AttachResult("reverse-start", {
                 "local": self._pending_local, "host": self._pending_host,
                 "provider": row["provider"], "client_root": root})
+        elif row["kind"] == "history-open":
+            self._open_history(row["provider"])
+        elif row["kind"] == "history-pick":
+            history = self._history
+            self.reverse_open = False
+            return AttachResult("reverse-start", {
+                "local": self._pending_local, "host": self._pending_host,
+                "provider": history["provider"],
+                "client_root": history["root"], "session_id": row["id"]})
         self._focus_dirty = True
         return None
 
@@ -2265,7 +2335,8 @@ class Client(object):
 
     def _reverse_can_go_back(self):
         stage = self.reverse_stage
-        return stage in ("key", "key-host", "key-delete", "host-delete") \
+        return stage in ("key", "key-host", "key-delete", "host-delete",
+                         "history") \
             or (stage == "provider" and bool(self._pending_host))
 
     def _reverse_back_label(self):
@@ -2275,6 +2346,9 @@ class Client(object):
         """One stage back (q / Esc / the title's ‹ 뒤로), else close."""
         if self.reverse_stage in self.KEY_STAGES:
             self._key_back()
+        elif self.reverse_stage == "history":
+            self.reverse_stage = "provider"
+            self.reverse_sel = 0
         elif self.reverse_stage == "host-delete" or \
                 (self.reverse_stage == "provider" and self._pending_host):
             self.reverse_stage = "menu"  # back to the host menu
@@ -2325,6 +2399,7 @@ class Client(object):
         keys = self.reverse_stage in self.KEY_STAGES
         title = " SSH 키 " if keys else " 호스트 " \
             if self.reverse_stage in ("menu", "host-delete") \
+            else " 이전 대화 " if self.reverse_stage == "history" \
             else " 리버스 에이전트 "
         back = self._reverse_back_label()
         fill = max(0, inner - self._width(title) - self._width(back))
@@ -2349,6 +2424,10 @@ class Client(object):
         elif self.reverse_stage == "menu" and self._pending_host:
             subtitle = " %s — %s" % (self._pending_host.get("name", "?"),
                                       self._pending_host.get("address", ""))
+        elif self.reverse_stage == "history" and self._history:
+            subtitle = " %s · %s" % (
+                self._history["provider"],
+                (self._pending_host or {}).get("name", "호스트"))
         elif not self._pending_host and not self._pending_local:
             subtitle = " 왼쪽 탭에서 '+ 호스트 추가…'를 먼저 눌러주세요"
         else:

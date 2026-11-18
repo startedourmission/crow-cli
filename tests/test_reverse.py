@@ -448,3 +448,271 @@ class RemoteForwardTests(unittest.TestCase):
             gone.terminate.assert_called_once()
             self.assertNotIn(("pane", "p2"), forwards)
             self.assertEqual(len(procs), 4)
+
+
+class McpEndToEndTests(unittest.TestCase):
+    """The agent's view: JSON-RPC over the real proxy → bridge → tools,
+    every crow_client tool on its happy path and at its edges."""
+
+    def setUp(self):
+        self.ws = tempfile.TemporaryDirectory(prefix="ccw-", dir="/tmp")
+        self.outside = tempfile.TemporaryDirectory(prefix="cco-", dir="/tmp")
+        self.root = os.path.realpath(self.ws.name)
+        Path(self.outside.name, "secret.txt").write_text("SECRET")
+        os.symlink(self.outside.name, os.path.join(self.root, "link"))
+        self.token = "t" * 32
+        self.bridge = subprocess.Popen(
+            [sys.executable, CROW, "agent-bridge", "--root", self.root,
+             "--token", self.token], stdout=subprocess.PIPE, text=True)
+        self.port = json.loads(self.bridge.stdout.readline())["port"]
+        self.proxy = self.start_proxy(self.port, self.token)
+        self.next_id = 0
+
+    def tearDown(self):
+        for proc in (self.proxy, self.bridge):
+            proc.kill()
+            proc.wait()
+            for stream in (proc.stdin, proc.stdout):
+                if stream:
+                    stream.close()
+        self.ws.cleanup()
+        self.outside.cleanup()
+
+    def start_proxy(self, port, token):
+        return subprocess.Popen(
+            [sys.executable, CROW, "agent-proxy", json.dumps(
+                {"host": "127.0.0.1", "port": port, "token": token})],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+
+    def rpc(self, method, params=None, proxy=None):
+        proxy = proxy or self.proxy
+        self.next_id += 1
+        proxy.stdin.write(json.dumps({"jsonrpc": "2.0", "id": self.next_id,
+                                      "method": method,
+                                      "params": params or {}}) + "\n")
+        proxy.stdin.flush()
+        return json.loads(proxy.stdout.readline())
+
+    def call(self, name, **arguments):
+        response = self.rpc("tools/call", {"name": name,
+                                           "arguments": arguments})
+        result = response["result"]
+        text = result["content"][0]["text"]
+        if result.get("isError"):
+            return None, text
+        return json.loads(text), None
+
+    def test_handshake_lists_the_six_tools(self):
+        init = self.rpc("initialize", {"protocolVersion": "2024-11-05"})
+        self.assertEqual(init["result"]["serverInfo"]["name"], "crow-client")
+        names = [t["name"] for t in self.rpc("tools/list")["result"]["tools"]]
+        self.assertEqual(names, ["workspace_info", "list_directory",
+                                 "read_file", "write_file", "edit_file",
+                                 "shell"])
+        self.assertIn("error", self.rpc("no/such/method"))
+        _value, error = self.call("rm_rf")
+        self.assertIn("Unknown", error)
+
+    def test_files_stay_inside_the_workspace(self):
+        info, _ = self.call("workspace_info")
+        self.assertEqual(info["root"], self.root)
+        written, _ = self.call("write_file", path="d/e/새 파일.txt",
+                               text="한글\n")
+        self.assertTrue(written["written"])
+        read, _ = self.call("read_file", path="d/e/새 파일.txt")
+        self.assertEqual(read["text"], "한글\n")
+        listing, _ = self.call("list_directory", path="d")
+        self.assertEqual(listing, [{"name": "e", "directory": True}])
+        for path in ("../x", "/etc/hosts", "link/secret.txt",
+                     self.outside.name + "/secret.txt"):
+            value, error = self.call("read_file", path=path)
+            self.assertIsNone(value, path)
+            self.assertIn("outside", error, path)
+        _value, error = self.call("write_file", path="link/new.txt",
+                                  text="x")
+        self.assertIn("outside", error)
+        self.assertFalse(os.path.exists(
+            os.path.join(self.outside.name, "new.txt")))
+
+    def test_write_and_edit_refuse_ambiguity(self):
+        self.call("write_file", path="a.txt", text="one one")
+        _value, error = self.call("write_file", path="a.txt", text="x")
+        self.assertIn("exists", error)
+        _value, error = self.call("edit_file", path="a.txt",
+                                  old_text="one", new_text="two")
+        self.assertIn("exactly once", error)
+        self.call("edit_file", path="a.txt", old_text="one one",
+                  new_text="two")
+        self.assertEqual(Path(self.root, "a.txt").read_text(), "two")
+
+    def test_big_and_binary_files(self):
+        Path(self.root, "big.txt").write_text("x" * 250000)
+        read, _ = self.call("read_file", path="big.txt")
+        self.assertEqual((len(read["text"]), read["truncated"]),
+                         (200000, True))
+        Path(self.root, "bin").write_bytes(b"\xff\xfe\x00")
+        value, error = self.call("read_file", path="bin")
+        self.assertIsNone(value)
+        self.assertTrue(error)
+
+    def test_shell_runs_on_the_client_in_the_workspace(self):
+        done, _ = self.call("shell", command="pwd; echo 한글; exit 3")
+        self.assertEqual(done["exit_code"], 3)
+        self.assertEqual(done["output"].splitlines(), [self.root, "한글"])
+        _value, error = self.call("shell", command="pwd",
+                                  cwd=self.outside.name)
+        self.assertIn("outside", error)
+        _value, error = self.call("shell", command="sleep 5", timeout=1)
+        self.assertIn("time", error)
+
+    def test_bridge_refuses_a_wrong_token(self):
+        import socket
+        sock = socket.create_connection(("127.0.0.1", self.port))
+        sock.sendall(b'{"crow_bridge_token": "wrong"}\n')
+        sock.settimeout(3)
+        self.assertEqual(sock.recv(100), b"")  # closed without a reply
+        sock.close()
+        info, _ = self.call("workspace_info")  # the real proxy still works
+        self.assertEqual(info["root"], self.root)
+
+
+class ReverseCapabilityTests(unittest.TestCase):
+    """What a reverse agent may use beyond crow_client (web, subagents),
+    the client's project instructions, and resumable history."""
+
+    def setUp(self):
+        from unittest import mock
+        self.home = tempfile.mkdtemp(prefix="cch-", dir="/tmp")
+        self.bin = tempfile.mkdtemp(prefix="ccb-", dir="/tmp")
+        self.ws = tempfile.mkdtemp(prefix="ccw-", dir="/tmp")
+        helps = {
+            "claude": "--tools --mcp-config --strict-mcp-config --settings",
+            "codex": "--dangerously-bypass-hook-trust --search",
+            "grok": "--rules --always-approve"}
+        for name, text in helps.items():
+            path = Path(self.bin, name)
+            path.write_text("#!/bin/sh\necho '%s'\n" % text)
+            path.chmod(0o755)
+        patcher = mock.patch.dict(os.environ, HOME=self.home,
+                                  PATH=self.bin + ":/usr/bin:/bin")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        for var in ("CLAUDE_CONFIG_DIR", "CODEX_HOME"):
+            patcher = mock.patch.dict(os.environ)
+            patcher.start()
+            os.environ.pop(var, None)
+            self.addCleanup(patcher.stop)
+        import shutil
+        for folder in (self.home, self.bin, self.ws):
+            self.addCleanup(shutil.rmtree, folder, True)
+
+    def launch_argv(self, provider, **extra):
+        request = dict({"provider": provider, "client_id": "cid",
+                        "client_root": self.ws, "bridge_port": 1,
+                        "token": "t", "python": sys.executable}, **extra)
+        prepared = reverse.prepare(request)
+        launch = json.loads(Path(prepared["launch"], "launch.json")
+                            .read_text())
+        return launch["argv"]
+
+    def test_web_and_subagents_are_open_server_tools_stay_shut(self):
+        argv = self.launch_argv("claude")
+        tools_list = argv[argv.index("--tools") + 1].split(",")
+        for name in ("WebSearch", "WebFetch", "Task"):
+            self.assertIn(name, tools_list)
+        for name in ("Bash", "Read", "Edit"):
+            self.assertNotIn(name, tools_list)
+        self.assertIn("--strict-mcp-config", argv)
+        codex = self.launch_argv("codex")
+        self.assertIn("--search", codex)
+        self.assertNotIn("multi_agent", codex)
+        grok = self.launch_argv("grok")
+        self.assertNotIn("--no-subagents", grok)
+        denied = [grok[i + 1] for i, a in enumerate(grok) if a == "--deny"]
+        self.assertIn("Bash", denied)
+        self.assertNotIn("WebSearch", denied)
+        import io
+        for name, allowed in [("WebSearch", True), ("WebFetch", True),
+                              ("Task", True), ("Bash", False),
+                              ("Read", False), ("Write", False),
+                              ("mcp__notion__search", False)]:
+            old = sys.stdin
+            sys.stdin = io.StringIO(json.dumps({"tool_name": name}))
+            try:
+                decision = reverse.guard()["hookSpecificOutput"][
+                    "permissionDecision"]
+            finally:
+                sys.stdin = old
+            self.assertEqual(decision, "allow" if allowed else "deny", name)
+
+    def test_project_notes_reach_the_instructions(self):
+        Path(self.ws, "CLAUDE.md").write_text("Use tabs. 한글 OK\n")
+        Path(self.ws, ".claude").mkdir()
+        Path(self.ws, ".claude", "CLAUDE.md").write_text("Nested rule\n")
+        Path(self.ws, "AGENTS.md").write_text("x" * 40000)
+        notes = reverse.project_notes(self.ws)
+        self.assertLess(notes.index("--- CLAUDE.md ---"),
+                        notes.index("--- .claude/CLAUDE.md ---"))
+        self.assertIn("Use tabs. 한글 OK", notes)
+        self.assertIn("[… truncated]", notes)
+        self.assertLess(len(notes), reverse.NOTES_MAX + 500)
+        self.assertEqual(reverse.project_notes(self.bin), "")
+        argv = self.launch_argv("claude", project_notes=notes)
+        prompt = argv[argv.index("--append-system-prompt") + 1]
+        self.assertIn("Project instructions from the client", prompt)
+        self.assertIn("Nested rule", prompt)
+
+    def write_lines(self, path, entries):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("".join(json.dumps(e) + "\n" for e in entries))
+
+    def test_history_lists_this_folders_conversations_newest_first(self):
+        import re as re_mod
+        workspace = reverse.server_workspace("cid", self.ws)
+        claude = Path(self.home, ".claude", "projects",
+                      re_mod.sub(r"[^A-Za-z0-9]", "-", workspace))
+        self.write_lines(claude / "old.jsonl", [
+            {"type": "user", "isMeta": True, "message": {"content": "meta"}},
+            {"type": "user", "message": {"content": "<command-name>x"}},
+            {"type": "user", "message": {"content": [
+                {"type": "text", "text": "로그인 버그   고쳐줘"}]}}])
+        self.write_lines(claude / "new.jsonl", [
+            {"type": "summary", "summary": "README 정리"},
+            {"type": "user", "message": {"content": "readme"}}])
+        self.write_lines(claude / "empty.jsonl", [{"type": "system"}])
+        os.utime(claude / "old.jsonl", (1000, 1000))
+        listed = reverse.history({"provider": "claude", "client_id": "cid",
+                                  "client_root": self.ws})
+        self.assertEqual([(i["id"], i["title"]) for i in listed],
+                         [("new", "README 정리"), ("old", "로그인 버그 고쳐줘")])
+        sessions = Path(self.home, ".codex", "sessions", "2026", "11")
+        self.write_lines(sessions / "rollout-a.jsonl", [
+            {"type": "session_meta", "payload": {"id": "A",
+                                                 "cwd": workspace}},
+            {"type": "event_msg", "payload": {"type": "user_message",
+                                              "message": "codex 질문"}}])
+        self.write_lines(sessions / "rollout-b.jsonl", [
+            {"type": "session_meta", "payload": {"id": "B",
+                                                 "cwd": "/elsewhere"}},
+            {"type": "event_msg", "payload": {"type": "user_message",
+                                              "message": "other"}}])
+        listed = reverse.history({"provider": "codex", "client_id": "cid",
+                                  "client_root": self.ws})
+        self.assertEqual([(i["id"], i["title"]) for i in listed],
+                         [("A", "codex 질문")])
+        self.assertEqual(reverse.history({"provider": "grok",
+                                          "client_id": "cid",
+                                          "client_root": self.ws}), [])
+        # the server command the client calls over ssh
+        result = subprocess.run(
+            [sys.executable, CROW, "agent-history"], input=json.dumps(
+                {"provider": "claude", "client_id": "cid",
+                 "client_root": self.ws}), capture_output=True, text=True)
+        self.assertEqual([i["id"] for i in json.loads(result.stdout)],
+                         ["new", "old"])
+
+    def test_resume_passes_the_conversation_to_the_agent(self):
+        argv = self.launch_argv("claude", session_id="abc-123")
+        self.assertEqual(argv[-2:], ["--resume", "abc-123"])
+        argv = self.launch_argv("codex", session_id="abc-123")
+        self.assertEqual(argv[-2:], ["resume", "abc-123"])

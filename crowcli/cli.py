@@ -546,6 +546,7 @@ def run_attach(name):
 
             client = Client(object(), status_provider=status_text,
                             layout_saver=save_layout,
+                            history_provider=reverse_history,
                             explorer_root_provider=explorer_root,
                             reverse_data_provider=reverse_data,
                             sidebar_data_provider=sidebar_data,
@@ -718,10 +719,11 @@ def run_attach(name):
                 continue
             if result.action == "reverse-start":
                 payload = result.arg
-                existing = find_reverse_session(
-                    registry_mod.load_registry(), payload["provider"],
-                    payload["client_root"], payload["host"],
-                    payload["local"])
+                existing = None if payload.get("session_id") else \
+                    find_reverse_session(
+                        registry_mod.load_registry(), payload["provider"],
+                        payload["client_root"], payload["host"],
+                        payload["local"])
                 if existing:
                     name = existing
                     continue
@@ -733,7 +735,8 @@ def run_attach(name):
                 try:
                     name = launch_reverse_agent(
                         payload["provider"], payload["client_root"],
-                        host_ref=payload["host"], local=payload["local"])
+                        host_ref=payload["host"], local=payload["local"],
+                        session_id=payload.get("session_id"))
                     notice["text"] = None
                 except (SystemExit, subprocess.SubprocessError, OSError,
                         ValueError) as error:
@@ -2012,6 +2015,35 @@ def remote_prepare(record, request):
     return json.loads(result.stdout.strip().splitlines()[-1])
 
 
+def reverse_history(provider, client_root, host_ref=None, local=False):
+    """Earlier conversations of `provider` for this client folder on the
+    host: [{"id", "title", "updated"}], newest first. Raises with a short
+    reason when the host can't be asked."""
+    if local:
+        return []  # sandboxes are per session; nothing to come back to
+    client_root = tools_mod.canonical(client_root)
+    reg = registry_mod.load_registry()
+    record = host_record(host_ref, reg)
+    request = json.dumps({"provider": provider,
+                          "client_id": reg.data["client_id"],
+                          "client_root": client_root})
+
+    args = ssh_base(record)
+    # Runs behind the attached screen: never let ssh ask for a password.
+    args = args[:1] + ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10"] \
+        + args[1:] + ["python3 ~/.crow-cli/lib/crow agent-history"]
+    result = subprocess.run(args, input=request, capture_output=True,
+                            text=True, timeout=30)
+    if result.returncode != 0 and "agent-history" in result.stderr:
+        raise ValueError("서버의 crow-cli가 오래됐어요 — 에이전트를 한 번 "
+                         "새로 실행하면 업데이트돼요")
+    if result.returncode != 0:
+        detail = (result.stderr or "").strip().splitlines()
+        raise ValueError(detail[-1][:120] if detail else
+                         "서버에 물어보지 못했어요")
+    return json.loads(result.stdout.strip().splitlines()[-1])
+
+
 def remote_start(record, pane_id, cwd, command):
     """Start a pane's agent PTY on the server."""
     try:
@@ -2032,6 +2064,8 @@ def start_reverse_pane(window, pane, client_id):
     bridge = ensure_bridge(meta["client_root"])
     request = {"provider": meta["provider"], "client_id": client_id,
                "client_root": meta["client_root"],
+               "project_notes": reverse_mod.project_notes(
+                   meta["client_root"]),
                "bridge_host": "127.0.0.1", "token": bridge["token"]}
     if meta.get("remote_host"):
         record = remote_record(meta)
@@ -2128,7 +2162,7 @@ def change_reverse_folder(reg, window, pane_id, client_root):
 
 
 def launch_reverse_agent(provider, client_root, name=None, host_ref=None,
-                         local=False):
+                         local=False, session_id=None):
     """Create (but do not attach) a reverse-agent session. Shared by the
     reverse-agent CLI command and the in-UI reverse panel."""
     client_root = tools_mod.canonical(client_root)
@@ -2153,6 +2187,9 @@ def launch_reverse_agent(provider, client_root, name=None, host_ref=None,
                    "bridge_port": bridge["port"], "token": bridge["token"],
                    "python": sys.executable, "runtime_path": ENTRY,
                    "server_home": server_home}
+        if session_id:
+            request["session_id"] = session_id
+        request["project_notes"] = reverse_mod.project_notes(client_root)
         prepared = reverse_mod.prepare(request)
         meta = {"client_root": client_root, "session_root": session_root,
                 "server_home": server_home, "provider": provider,
@@ -2188,7 +2225,10 @@ def launch_reverse_agent(provider, client_root, name=None, host_ref=None,
                    "client_root": client_root,
                    "bridge_host": "127.0.0.1", "bridge_port": remote_port,
                    "token": bridge["token"], "python": "python3",
-                   "runtime_path": "$HOME/.crow-cli/lib/crow"}
+                   "runtime_path": "$HOME/.crow-cli/lib/crow",
+                   "project_notes": reverse_mod.project_notes(client_root)}
+        if session_id:
+            request["session_id"] = session_id
         tunnel = subprocess.Popen(
             ssh_tunnel_args(record, ["-R", "127.0.0.1:%d:127.0.0.1:%d"
                                      % (remote_port, bridge["port"])]),
@@ -2451,6 +2491,8 @@ def build_parser():
     p.set_defaults(fn=lambda a: (print(json.dumps(reverse_mod.guard())), 0)[1])
     p = sub.add_parser("agent-prepare")
     p.set_defaults(fn=_run_prepare)
+    p = sub.add_parser("agent-history")
+    p.set_defaults(fn=_run_history)
     return parser
 
 
@@ -2468,6 +2510,12 @@ def _run_prepare(_args):
         eprint(str(error))
         return 1
     print(json.dumps(result))
+    return 0
+
+
+def _run_history(_args):
+    request = json.load(sys.stdin)
+    print(json.dumps(reverse_mod.history(request), ensure_ascii=False))
     return 0
 
 
