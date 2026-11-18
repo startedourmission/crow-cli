@@ -195,6 +195,31 @@ class UiTests(unittest.TestCase):
         again = self.attach([(b"\x02d", 1.0)])  # replay holds it: not resent
         self.assertNotIn(b"\x1b]52;", again)
 
+    def test_closing_a_sessions_last_pane_moves_to_another_session(self):
+        self.cli("new", "-d", "-s", "demo", "-c", self.ws.name)
+        self.cli("new", "-d", "-s", "other", "-c", self.ws.name)
+        self.addCleanup(subprocess.run, [CROW, "kill-session", "-t",
+                                         "other"], env=self.env,
+                        capture_output=True, timeout=30)
+        out = self.attach([(b"\x02x", 0.6), (b"y", 1.5),
+                           (b"echo STILL-HERE\r", 1.0), (b"\x02d", 1.0)])
+        self.assertIn("세션 demo도 닫혀요".encode(), out)  # warned first
+        listing = self.cli("ls").stdout
+        self.assertNotIn("demo", listing)
+        self.assertIn("other", listing)
+        self.assertIn(b"detached from other", out)  # crow kept going
+        self.assertIn("STILL-HERE", self.cli("capture", "-t",
+                                             "other").stdout)
+
+    def test_last_program_exiting_moves_to_another_session(self):
+        self.cli("new", "-d", "-s", "demo", "-c", self.ws.name)
+        self.cli("new", "-d", "-s", "other", "-c", self.ws.name)
+        self.addCleanup(subprocess.run, [CROW, "kill-session", "-t",
+                                         "other"], env=self.env,
+                        capture_output=True, timeout=30)
+        out = self.attach([(b"exit\r", 2.0), (b"\x02d", 1.0)])
+        self.assertIn(b"detached from other", out)
+
     def test_prefix_x_closes_pane_after_in_ui_confirm(self):
         self.cli("new", "-d", "-s", "demo", "-c", self.ws.name)
         self.cli("split-window", "-t", "demo", "-c", self.ws.name)

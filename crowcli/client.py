@@ -2998,6 +2998,14 @@ class Client(object):
     def _confirm_kill_pane(self, pane_id):
         runtime = self._runtime(pane_id)
         name = runtime.pane.get("name", "pane") if runtime else "pane"
+        tabs = self.windows_provider() if self.windows_provider else []
+        if len(self.runtimes) <= 1 and len(tabs) <= 1:
+            # The session's last pane: closing it ends the session too.
+            self._menu_confirm(
+                "마지막 pane — 세션 %s도 닫혀요" % self._session_name,
+                "닫기 (세션 종료)",
+                lambda: AttachResult("kill-pane", (pane_id, True)))
+            return
         self._menu_confirm("%s 닫을까요?" % name, "닫기 (프로그램 종료)",
                            lambda: AttachResult("kill-pane", (pane_id, True)))
 

@@ -622,7 +622,9 @@ def run_attach(name):
                 with_registry(drop)
                 reg = registry_mod.load_registry()
                 if reg.find(name) is None:
-                    if session["kind"] == "ssh" and other_session(name):
+                    # The session's last program ended: move on to another
+                    # session rather than leaving crow.
+                    if other_session(name):
                         name = other_session(name)
                         continue
                     return int(code or 0) if code else 0
@@ -979,7 +981,13 @@ def run_attach(name):
                             reg.remove_session(name)
                     with_registry(drop2)
                     if registry_mod.load_registry().find(name) is None:
-                        return 0
+                        # its last pane: carry on in another session
+                        closed, name = name, other_session(name)
+                        if name is None:
+                            Client.leave_terminal()
+                            print("[crow-cli] %s 세션을 닫았습니다 "
+                                  "(남은 세션 없음)" % closed)
+                            return 0
                 continue
             if result.action == "choose":
                 chosen = with_registry(pick_session)
