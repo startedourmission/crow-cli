@@ -430,6 +430,7 @@ def session_where(session, meta):
 
 def run_attach(name):
     forwards = {}
+    unreachable = set()  # sessions whose tunnels just failed to open
     remote_drops = 0
     notice = {"text": None}  # last failure, shown in the sidebar
     try:
@@ -445,7 +446,20 @@ def run_attach(name):
                 eprint("crow-cli: session %s has no windows" % name)
                 return 1
             spawn_window(window)
-            ensure_reverse_forwards(reg, session, forwards)
+            try:
+                ensure_reverse_forwards(reg, session, forwards)
+            except SystemExit:
+                # This session's server can't be reached right now. Don't
+                # quit crow over it: keep the session for a later retry and
+                # open one that works (a fresh local one if none does).
+                for proc in forwards.values():
+                    proc.terminate()
+                forwards.clear()
+                unreachable.add(name)
+                name = other_session(unreachable) or with_registry(
+                    lambda reg: new_local_session(reg, os.getcwd()))
+                continue
+            unreachable.clear()
 
             def mark_attached(reg):
                 found = reg.find(name)
@@ -602,10 +616,14 @@ def run_attach(name):
                     if remote_drops < 3:
                         time.sleep(1)
                         continue
-                    print("\n[crow-cli] %s 원격 연결이 계속 끊깁니다 — 서버의 "
-                          "에이전트는 그대로 있어요. 재접속: crow attach -t %s"
-                          % (name, name))
-                    return 1
+                    # The agent is still on the server; leave the session
+                    # for a later re-attach and carry on in one that works.
+                    remote_drops = 0
+                    notice["text"] = None
+                    unreachable.add(name)
+                    name = other_session(unreachable) or with_registry(
+                        lambda reg: new_local_session(reg, os.getcwd()))
+                    continue
                 print("\n[crow-cli] pane exited (code %s)" % (code,))
 
                 def drop(reg):
@@ -1934,9 +1952,12 @@ def disconnect_host(record):
 
 
 def other_session(exclude):
-    """The most recently attached session other than exclude."""
+    """The most recently attached session other than exclude (a name, or
+    a set of names)."""
+    if isinstance(exclude, str) or exclude is None:
+        exclude = {exclude}
     sessions = [s for s in registry_mod.load_registry().data["sessions"]
-                if s["name"] != exclude]
+                if s["name"] not in exclude]
     if not sessions:
         return None
     return max(sessions, key=lambda s: s.get("last_attached") or 0)["name"]
