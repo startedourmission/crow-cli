@@ -220,6 +220,38 @@ class UiTests(unittest.TestCase):
         out = self.attach([(b"exit\r", 2.0), (b"\x02d", 1.0)])
         self.assertIn(b"detached from other", out)
 
+    def test_unreachable_remote_session_opens_a_working_one(self):
+        self.cli("new", "-d", "-s", "other", "-c", self.ws.name)
+        self.addCleanup(subprocess.run, [CROW, "kill-session", "-t",
+                                         "other"], env=self.env,
+                        capture_output=True, timeout=30)
+        # its local program ends soon; the pane then stands for one
+        # on a server
+        self.cli("new", "-d", "-s", "demo", "-c", self.ws.name, "--", "sleep 5")
+        state_path = Path(self.home.name) / "state.json"
+        state = json.loads(state_path.read_text())
+        demo = next(s for s in state["sessions"] if s["name"] == "demo")
+        demo["last_attached"] = time.time() + 60  # the most recent one
+        demo["kind"] = "reverse-agent"
+        # nothing listens on port 1, so its ssh forward can't open
+        demo["windows"][0]["meta"] = {
+            "provider": "claude", "client_root": self.ws.name,
+            "remote_host": "127.0.0.1", "remote_ssh_port": 1,
+            "bridge_remote_port": 47999,
+            "remote_socket": "/tmp/crow-none/x.sock"}
+        state_path.write_text(json.dumps(state))
+
+        def stop_bridges():
+            for path in (Path(self.home.name) / "bridges").glob("*.json"):
+                try:
+                    os.kill(json.loads(path.read_text())["pid"], 15)
+                except (OSError, ValueError, KeyError):
+                    pass
+        self.addCleanup(stop_bridges)
+        out = self.attach([(b"", 4.0), (b"\x02d", 1.0)])
+        self.assertIn(b"detached from other", out)  # crow opened a live one
+        self.assertIn("demo", self.cli("ls").stdout)  # kept for a retry
+
     def test_prefix_x_closes_pane_after_in_ui_confirm(self):
         self.cli("new", "-d", "-s", "demo", "-c", self.ws.name)
         self.cli("split-window", "-t", "demo", "-c", self.ws.name)
